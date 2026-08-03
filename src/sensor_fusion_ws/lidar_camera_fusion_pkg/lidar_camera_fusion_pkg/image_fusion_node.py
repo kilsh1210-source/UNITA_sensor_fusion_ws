@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import math
+import numpy as np
+import cv2
+from typing import Tuple, Optional
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+
+from sensor_msgs.msg import Image, LaserScan
+from cv_bridge import CvBridge
+from std_msgs.msg import Header
+
+from interfaces_pkg.msg import DetectionArray
+
+
+class FusionVisualizerNode(Node):
+    """
+    - 동기화(message_filters) 제거: 이미지 콜백이 오면 무조건 화면 출력
+    - 최신 LaserScan / DetectionArray가 있으면 오버레이
+    - QoS는 sensor_data(BEST_EFFORT)로 고정 -> 카메라/라이다와 호환성 최대화
+    """
+
+    def __init__(self):
+        super().__init__('fusion_visualizer_node')
+
+        # -------------------------
+        # Topics
+        # -------------------------
+        self.declare_parameter('image_topic', '/camera1/image_raw')
+        self.declare_parameter('scan_topic', '/scan')
+        self.declare_parameter('det_topic', '/detections')
+
+        self.declare_parameter('publish_annotated', False)
+        self.declare_parameter('annotated_topic', '/fusion/annotated_image')
+        self.declare_parameter('display', True)
+
+        # -------------------------
+        # Image size / Intrinsic
+        # -------------------------
+        self.declare_parameter('image_width', 640)
+        self.declare_parameter('image_height', 480)
+        self.declare_parameter('fx', 559.431712)
+        self.declare_parameter('fy', 568.785249)
+        self.declare_parameter('cx', 302.888725)
+        self.declare_parameter('cy', 329.408991)
+
+        # -------------------------
+        # Extrinsic (LiDAR -> Camera)
+        # -------------------------
+        self.declare_parameter('cam_x_offset', 0.0)
+        self.declare_parameter('cam_height', 0.064)
+
+        # -------------------------
+        # LiDAR filtering / projection
+        # -------------------------
+        self.declare_parameter('max_range', 10.0)
+        self.declare_parameter('min_range', 0.1)
+        self.declare_parameter('min_cam_z', 0.1)
+
+        self.declare_parameter('enable_fov_filter', True)
+        self.declare_parameter('cam_fov_deg', 55.0)
+        self.declare_parameter('fov_center_deg', 183.0)
+
+        self.declare_parameter('point_stride', 2)      # 라이다 점 샘플링
+        self.declare_parameter('distance_method', 'p20')  # min / p20 / median
+        self.declare_parameter('person_keyword', 'person')
+
+        # 최신 데이터 유효 시간(초): 너무 오래된 scan/det는 무시
+        self.declare_parameter('max_age_scan', 0.5)
+        self.declare_parameter('max_age_det', 0.5)
+
+        # Load params
+        self.image_topic = self.get_parameter('image_topic').value
+        self.scan_topic = self.get_parameter('scan_topic').value
+        self.det_topic = self.get_parameter('det_topic').value
+
+        self.publish_annotated = bool(self.get_parameter('publish_annotated').value)
+        self.annotated_topic = self.get_parameter('annotated_topic').value
+        self.display = bool(self.get_parameter('display').value)
+
+        self.image_width = int(self.get_parameter('image_width').value)
+        self.image_height = int(self.get_parameter('image_height').value)
+
+        fx = float(self.get_parameter('fx').value)
+        fy = float(self.get_parameter('fy').value)
+        cx = float(self.get_parameter('cx').value)
+        cy = float(self.get_parameter('cy').value)
+        self.K = np.array([[fx, 0.0, cx],
+                           [0.0, fy, cy],
+                           [0.0, 0.0, 1.0]], dtype=np.float64)
+
+        dist = float(self.get_parameter('cam_x_offset').value)
+        height = float(self.get_parameter('cam_height').value)
+        self.extrinsic_mat = self._init_extrinsic(dist, height)
+
+        self.max_range = float(self.get_parameter('max_range').value)
+        self.min_range = float(self.get_parameter('min_range').value)
+        self.min_cam_z = float(self.get_parameter('min_cam_z').value)
+
+        self.enable_fov_filter = bool(self.get_parameter('enable_fov_filter').value)
+        self.fov_deg = float(self.get_parameter('cam_fov_deg').value)
+        self.fov_center_rad = math.radians(float(self.get_parameter('fov_center_deg').value))
+
+        self.point_stride = int(self.get_parameter('point_stride').value)
+        self.distance_method = str(self.get_parameter('distance_method').value).lower().strip()
+        self.person_keyword = str(self.get_parameter('person_keyword').value).lower().strip()
+
+        self.max_age_scan = float(self.get_parameter('max_age_scan').value)
+        self.max_age_det = float(self.get_parameter('max_age_det').value)
+
+        self.bridge = CvBridge()
+
+        # 최신 메시지 버퍼
+        self.last_scan: Optional[LaserScan] = None
+        self.last_scan_time = None
+
+        self.last_det: Optional[DetectionArray] = None
+        self.last_det_time = None
+
+        self.last_img_time = None
+
+        # Subscribers (QoS: sensor_data로 고정)
+        self.create_subscription(Image, self.image_topic, self.image_cb, qos_profile_sensor_data)
+        self.create_subscription(LaserScan, self.scan_topic, self.scan_cb, qos_profile_sensor_data)
+        self.create_subscription(DetectionArray, self.det_topic, self.det_cb, 10)  # det는 reliable여도 수신 가능
+
+        # Publisher
+        if self.publish_annotated:
+            self.pub_img = self.create_publisher(Image, self.annotated_topic, 10)
+        else:
+            self.pub_img = None
+
+        if self.display:
+            cv2.namedWindow("Fusion Visualizer", cv2.WINDOW_NORMAL)
+
+        # 디버그 타이머: 데이터 미수신 상태를 주기적으로 알려줌
+        self.create_timer(1.0, self.debug_timer)
+
+        self.get_logger().info(
+            f"FusionVisualizerNode started.\n"
+            f"  image_topic={self.image_topic}\n"
+            f"  scan_topic={self.scan_topic}\n"
+            f"  det_topic={self.det_topic}\n"
+            f"  publish_annotated={self.publish_annotated} ({self.annotated_topic})\n"
+        )
+
+    @staticmethod
+    def _init_extrinsic(dist: float, height: float) -> np.ndarray:
+        # 사용자 성공 코드와 동일한 구성
+        t_vec = np.array([0.0, height, dist], dtype=np.float64).reshape(3, 1)
+
+        R_axis_swap = np.array([
+            [0.0, -1.0, 0.0],
+            [0.0,  0.0, -1.0],
+            [1.0,  0.0, 0.0]
+        ], dtype=np.float64)
+
+        R_yaw_180 = np.array([
+            [-1.0, 0.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0]
+        ], dtype=np.float64)
+
+        R = R_axis_swap @ R_yaw_180
+
+        ext = np.eye(4, dtype=np.float64)
+        ext[:3, :3] = R
+        ext[:3, 3] = t_vec.flatten()
+        return ext
+
+    def debug_timer(self):
+        now = self.get_clock().now()
+        def age(t):
+            if t is None:
+                return None
+            return (now - t).nanoseconds / 1e9
+
+        img_age = age(self.last_img_time)
+        scan_age = age(self.last_scan_time)
+        det_age = age(self.last_det_time)
+
+        # 이미지가 아예 안 들어오면 검정 화면 고정입니다.
+        if img_age is None or img_age > 1.0:
+            self.get_logger().warn(
+                f"[No Image] image_topic='{self.image_topic}' is not arriving. "
+                f"scan_age={scan_age}, det_age={det_age}"
+            )
+
+    def scan_cb(self, msg: LaserScan):
+        self.last_scan = msg
+        self.last_scan_time = self.get_clock().now()
+
+    def det_cb(self, msg: DetectionArray):
+        self.last_det = msg
+        self.last_det_time = self.get_clock().now()
+
+    def image_cb(self, img_msg: Image):
+        self.last_img_time = self.get_clock().now()
+
+        # 1) image to cv2
+        try:
+            img = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f"imgmsg_to_cv2 failed: {e}")
+            return
+
+        h, w = img.shape[:2]
+
+        # 2) 최신 scan/det가 유효한지 확인
+        now = self.get_clock().now()
+
+        scan_ok = False
+        det_ok = False
+
+        if self.last_scan is not None and self.last_scan_time is not None:
+            scan_age = (now - self.last_scan_time).nanoseconds / 1e9
+            scan_ok = (scan_age <= self.max_age_scan)
+
+        if self.last_det is not None and self.last_det_time is not None:
+            det_age = (now - self.last_det_time).nanoseconds / 1e9
+            det_ok = (det_age <= self.max_age_det)
+
+        # 3) scan -> projected points
+        u_pix = np.array([], dtype=np.int32)
+        v_pix = np.array([], dtype=np.int32)
+        ranges = np.array([], dtype=np.float64)
+
+        if scan_ok:
+            u_pix, v_pix, ranges = self.project_scan_to_image(self.last_scan, w, h)
+            for i in range(0, len(u_pix), max(1, self.point_stride)):
+                cv2.circle(img, (int(u_pix[i]), int(v_pix[i])), 1, (0, 0, 255), -1)
+
+        # 4) detections overlay + distance
+        if det_ok:
+            for det in self.last_det.detections:
+                class_name = getattr(det, 'class_name', 'Unknown')
+                score = float(getattr(det, 'score', 0.0))
+
+                bbox = det.bbox
+                box_cx = float(bbox.center.position.x)
+                box_cy = float(bbox.center.position.y)
+                bw = float(bbox.size.x)
+                bh = float(bbox.size.y)
+
+                x1 = int(box_cx - bw / 2.0)
+                y1 = int(box_cy - bh / 2.0)
+                x2 = int(box_cx + bw / 2.0)
+                y2 = int(box_cy + bh / 2.0)
+
+                x1c = max(0, min(w - 1, x1))
+                y1c = max(0, min(h - 1, y1))
+                x2c = max(0, min(w - 1, x2))
+                y2c = max(0, min(h - 1, y2))
+
+                is_person = (self.person_keyword in str(class_name).lower())
+                color = (0, 0, 255) if is_person else (0, 255, 0)
+
+                cv2.rectangle(img, (x1c, y1c), (x2c, y2c), color, 2)
+
+                dist_m, best_uv = (None, None)
+                if scan_ok and len(ranges) > 0:
+                    dist_m, best_uv = self.estimate_distance_in_bbox(
+                        u_pix, v_pix, ranges, x1c, y1c, x2c, y2c
+                    )
+
+                if dist_m is None:
+                    text = f"{class_name} {score:.2f}  dist:N/A"
+                else:
+                    text = f"{class_name} {score:.2f}  dist:{dist_m:.2f}m"
+
+                cv2.putText(img, text, (x1c, max(0, y1c - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+
+                if best_uv is not None:
+                    cv2.circle(img, best_uv, 4, (255, 255, 255), -1)
+
+        # 5) show / publish
+        if self.display:
+            cv2.imshow("Fusion Visualizer", img)
+            cv2.waitKey(1)
+
+        if self.pub_img is not None:
+            out_msg = self.bridge.cv2_to_imgmsg(img, encoding='bgr8')
+            out_msg.header = Header()
+            out_msg.header.stamp = img_msg.header.stamp
+            out_msg.header.frame_id = img_msg.header.frame_id
+            self.pub_img.publish(out_msg)
+
+    def project_scan_to_image(self, scan_msg: LaserScan, img_w: int, img_h: int):
+        ranges = np.asarray(scan_msg.ranges, dtype=np.float64)
+        n = ranges.shape[0]
+        angles = scan_msg.angle_min + np.arange(n, dtype=np.float64) * scan_msg.angle_increment
+
+        finite = np.isfinite(ranges)
+        valid = finite & (ranges >= self.min_range) & (ranges <= min(float(scan_msg.range_max), self.max_range))
+
+        if self.enable_fov_filter:
+            half_fov = math.radians(self.fov_deg / 2.0)
+            angle_diff = np.abs(np.arctan2(np.sin(angles - self.fov_center_rad), np.cos(angles - self.fov_center_rad)))
+            valid = valid & (angle_diff <= half_fov)
+
+        if np.count_nonzero(valid) == 0:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.float64)
+
+        ranges_v = ranges[valid]
+        angles_v = angles[valid]
+
+        x = ranges_v * np.cos(angles_v)
+        y = ranges_v * np.sin(angles_v)
+        z = np.zeros_like(x)
+        ones = np.ones_like(x)
+
+        pts_lidar = np.vstack([x, y, z, ones])  # 4xN
+        pts_cam = self.extrinsic_mat @ pts_lidar
+
+        front = pts_cam[2, :] > self.min_cam_z
+        pts_cam = pts_cam[:, front]
+        ranges_v = ranges_v[front]
+
+        if pts_cam.shape[1] == 0:
+            return np.array([], dtype=np.int32), np.array([], dtype=np.int32), np.array([], dtype=np.float64)
+
+        pix = self.K @ pts_cam[:3, :]
+        u = pix[0, :] / pix[2, :]
+        v = pix[1, :] / pix[2, :]
+
+        u_i = u.astype(np.int32)
+        v_i = v.astype(np.int32)
+
+        inside = (u_i >= 0) & (u_i < img_w) & (v_i >= 0) & (v_i < img_h)
+        return u_i[inside], v_i[inside], ranges_v[inside]
+
+    def estimate_distance_in_bbox(self, u, v, ranges, x1, y1, x2, y2) -> Tuple[Optional[float], Optional[Tuple[int, int]]]:
+        mask = (u >= x1) & (u <= x2) & (v >= y1) & (v <= y2)
+        if np.count_nonzero(mask) == 0:
+            return None, None
+
+        r = ranges[mask]
+        uu = u[mask]
+        vv = v[mask]
+
+        if self.distance_method == 'min':
+            idx = int(np.argmin(r))
+            dist = float(r[idx])
+        elif self.distance_method == 'median':
+            dist = float(np.median(r))
+            idx = int(np.argmin(np.abs(r - dist)))
+        else:
+            dist = float(np.percentile(r, 20))
+            idx = int(np.argmin(np.abs(r - dist)))
+
+        best_uv = (int(uu[idx]), int(vv[idx]))
+        return dist, best_uv
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = FusionVisualizerNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if node.display:
+            cv2.destroyAllWindows()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

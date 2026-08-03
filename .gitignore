@@ -1,0 +1,18 @@
+# ROS2 build artifacts
+/build/
+/install/
+/log/
+
+# VS Code
+/.vscode/
+
+# Database files
+*.db
+
+# Python
+__pycache__/
+*.pyc
+
+# Temporary files
+*.swp
+*~
