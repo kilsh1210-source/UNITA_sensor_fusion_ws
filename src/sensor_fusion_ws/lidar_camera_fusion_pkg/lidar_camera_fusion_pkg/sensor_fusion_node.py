@@ -217,6 +217,30 @@ class SensorFusionNode(Node):
 
     #####################################################
 
+    def scan_points_in_bbox(self, x1, x2, step=4):
+
+        # bbox의 x1~x2 픽셀 범위를 훑으면서, 유효한(inf/nan 아닌) 라이다 리턴이
+        # 있는 (픽셀 x, 거리) 목록을 반환. 박스 중심 레이 1개만 보는 것보다
+        # 박스 폭 전체를 봐야 사람 일부가 순간적으로 빠지는 걸 방지할 수 있다.
+
+        points = []
+
+        x1c = max(0, int(x1))
+        x2c = min(self.image_width - 1, int(x2))
+
+        for px in range(x1c, x2c + 1, max(1, step)):
+
+            angle = self.pixel_to_angle(px)
+
+            distance = self.get_distance(angle)
+
+            if distance is not None:
+                points.append((px, distance))
+
+        return points
+
+    #####################################################
+
     def draw_detection(self, image, det):
 
         bbox = det.bbox
@@ -233,11 +257,12 @@ class SensorFusionNode(Node):
         x2 = int(cx + w / 2)
         y2 = int(cy + h / 2)
 
-        angle = self.pixel_to_angle(cx)
+        points = self.scan_points_in_bbox(x1, x2)
 
-        distance = self.get_distance(angle)
-
-                ###############################################
+        if points:
+            distance = min(d for _, d in points)
+        else:
+            distance = None
 
         if distance is None:
             text = det.class_name
@@ -254,13 +279,14 @@ class SensorFusionNode(Node):
             2
         )
 
-        cv2.circle(
-            image,
-            (int(cx), int(cy)),
-            4,
-            (0, 0, 255),
-            -1
-        )
+        for px, _ in points:
+            cv2.circle(
+                image,
+                (px, int(cy)),
+                3,
+                (0, 0, 255),
+                -1
+            )
 
         cv2.putText(
             image,
