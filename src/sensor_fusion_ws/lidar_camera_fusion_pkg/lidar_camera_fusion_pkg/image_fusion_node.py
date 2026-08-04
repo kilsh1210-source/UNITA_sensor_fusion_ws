@@ -9,6 +9,8 @@ from typing import Tuple, Optional
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from geometry_msgs.msg import TransformStamped
+from tf2_ros import Buffer, TransformListener
 
 from sensor_msgs.msg import Image, LaserScan
 from cv_bridge import CvBridge
@@ -53,6 +55,9 @@ class FusionVisualizerNode(Node):
         # -------------------------
         self.declare_parameter('cam_x_offset', 0.0)
         self.declare_parameter('cam_height', 0.064)
+        self.declare_parameter('use_urdf_extrinsic', True)
+        self.declare_parameter('lidar_frame_id', 'laser')
+        self.declare_parameter('camera_frame_id', 'camera_link')
 
         # -------------------------
         # LiDAR filtering / projection
@@ -65,8 +70,11 @@ class FusionVisualizerNode(Node):
         self.declare_parameter('cam_fov_deg', 55.0)
         self.declare_parameter('fov_center_deg', 183.0)
 
-        self.declare_parameter('point_stride', 2)      # 라이다 점 샘플링
-        self.declare_parameter('distance_method', 'p20')  # min / p20 / median
+        self.declare_parameter('point_stride', 1)       # 라이다 점 샘플링 간격 (1이면 전부 표시)
+        self.declare_parameter('draw_all_points', True) # 카메라 이미지 위에 라이다 포인트를 전부 표시할지 여부
+        self.declare_parameter('show_split_view', True)  # 전체 클라우드 뷰와 bbox-겹침 전용 뷰를 함께 보여줄지 여부
+        self.declare_parameter('distance_method', 'center')  # min / p20 / median / center
+        self.declare_parameter('distance_tolerance', 0.6)    # 거리 오차 허용 범위 [m]
         self.declare_parameter('person_keyword', 'person')
 
         # 최신 데이터 유효 시간(초): 너무 오래된 scan/det는 무시
@@ -93,9 +101,15 @@ class FusionVisualizerNode(Node):
                            [0.0, fy, cy],
                            [0.0, 0.0, 1.0]], dtype=np.float64)
 
+        self.use_urdf_extrinsic = bool(self.get_parameter('use_urdf_extrinsic').value)
+        self.lidar_frame_id = str(self.get_parameter('lidar_frame_id').value)
+        self.camera_frame_id = str(self.get_parameter('camera_frame_id').value)
+
         dist = float(self.get_parameter('cam_x_offset').value)
         height = float(self.get_parameter('cam_height').value)
         self.extrinsic_mat = self._init_extrinsic(dist, height)
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.max_range = float(self.get_parameter('max_range').value)
         self.min_range = float(self.get_parameter('min_range').value)
@@ -106,7 +120,10 @@ class FusionVisualizerNode(Node):
         self.fov_center_rad = math.radians(float(self.get_parameter('fov_center_deg').value))
 
         self.point_stride = int(self.get_parameter('point_stride').value)
+        self.draw_all_points = bool(self.get_parameter('draw_all_points').value)
+        self.show_split_view = bool(self.get_parameter('show_split_view').value)
         self.distance_method = str(self.get_parameter('distance_method').value).lower().strip()
+        self.distance_tolerance = float(self.get_parameter('distance_tolerance').value)
         self.person_keyword = str(self.get_parameter('person_keyword').value).lower().strip()
 
         self.max_age_scan = float(self.get_parameter('max_age_scan').value)
@@ -147,6 +164,40 @@ class FusionVisualizerNode(Node):
             f"  det_topic={self.det_topic}\n"
             f"  publish_annotated={self.publish_annotated} ({self.annotated_topic})\n"
         )
+
+    def _try_update_extrinsic_from_tf(self) -> None:
+        if not self.use_urdf_extrinsic:
+            return
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.camera_frame_id,
+                self.lidar_frame_id,
+                rclpy.time.Time()
+            )
+        except Exception:
+            return
+
+        translation = transform.transform.translation
+        rotation = transform.transform.rotation
+
+        quat = [rotation.x, rotation.y, rotation.z, rotation.w]
+        rot_mat = self._quaternion_to_matrix(quat)
+        t_vec = np.array([translation.x, translation.y, translation.z], dtype=np.float64)
+
+        ext = np.eye(4, dtype=np.float64)
+        ext[:3, :3] = rot_mat
+        ext[:3, 3] = t_vec
+        self.extrinsic_mat = ext
+
+    @staticmethod
+    def _quaternion_to_matrix(q) -> np.ndarray:
+        x, y, z, w = q
+        return np.array([
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ], dtype=np.float64)
 
     @staticmethod
     def _init_extrinsic(dist: float, height: float) -> np.ndarray:
@@ -210,6 +261,8 @@ class FusionVisualizerNode(Node):
 
         h, w = img.shape[:2]
 
+        self._try_update_extrinsic_from_tf()
+
         # 2) 최신 scan/det가 유효한지 확인
         now = self.get_clock().now()
 
@@ -231,8 +284,8 @@ class FusionVisualizerNode(Node):
 
         if scan_ok:
             u_pix, v_pix, ranges = self.project_scan_to_image(self.last_scan, w, h)
-            for i in range(0, len(u_pix), max(1, self.point_stride)):
-                cv2.circle(img, (int(u_pix[i]), int(v_pix[i])), 1, (0, 0, 255), -1)
+            if self.show_split_view:
+                self.draw_projected_points(img, u_pix, v_pix, ranges)
 
         # 4) detections overlay + distance
         if det_ok:
@@ -257,15 +310,18 @@ class FusionVisualizerNode(Node):
                 y2c = max(0, min(h - 1, y2))
 
                 is_person = (self.person_keyword in str(class_name).lower())
-                color = (0, 0, 255) if is_person else (0, 255, 0)
-
-                cv2.rectangle(img, (x1c, y1c), (x2c, y2c), color, 2)
-
                 dist_m, best_uv = (None, None)
                 if scan_ok and len(ranges) > 0:
                     dist_m, best_uv = self.estimate_distance_in_bbox(
                         u_pix, v_pix, ranges, x1c, y1c, x2c, y2c
                     )
+
+                if dist_m is None:
+                    color = (0, 0, 255) if is_person else (0, 165, 255)
+                else:
+                    color = (0, 255, 0) if is_person else (255, 0, 0)
+
+                cv2.rectangle(img, (x1c, y1c), (x2c, y2c), color, 2)
 
                 if dist_m is None:
                     text = f"{class_name} {score:.2f}  dist:N/A"
@@ -278,6 +334,9 @@ class FusionVisualizerNode(Node):
                 if best_uv is not None:
                     cv2.circle(img, best_uv, 4, (255, 255, 255), -1)
 
+        if self.show_split_view and scan_ok and det_ok:
+            self.draw_split_view(img, w, h, u_pix, v_pix, ranges, self.last_det.detections)
+
         # 5) show / publish
         if self.display:
             cv2.imshow("Fusion Visualizer", img)
@@ -289,6 +348,77 @@ class FusionVisualizerNode(Node):
             out_msg.header.stamp = img_msg.header.stamp
             out_msg.header.frame_id = img_msg.header.frame_id
             self.pub_img.publish(out_msg)
+
+    def draw_projected_points(self, img, u_pix, v_pix, ranges):
+        if len(u_pix) == 0:
+            return
+
+        stride = max(1, self.point_stride)
+        for idx in range(0, len(u_pix), stride):
+            if not self.draw_all_points and idx != 0:
+                continue
+
+            u = int(u_pix[idx])
+            v = int(v_pix[idx])
+            r = float(ranges[idx])
+            color = self._distance_to_color(r)
+            cv2.circle(img, (u, v), 1, color, -1)
+
+    def draw_split_view(self, img, w, h, u_pix, v_pix, ranges, detections):
+        if len(u_pix) == 0 or len(detections) == 0:
+            return
+
+        overlay = img.copy()
+        for det in detections:
+            bbox = det.bbox
+            box_cx = float(bbox.center.position.x)
+            box_cy = float(bbox.center.position.y)
+            bw = float(bbox.size.x)
+            bh = float(bbox.size.y)
+
+            x1 = int(box_cx - bw / 2.0)
+            y1 = int(box_cy - bh / 2.0)
+            x2 = int(box_cx + bw / 2.0)
+            y2 = int(box_cy + bh / 2.0)
+
+            x1c = max(0, min(w - 1, x1))
+            y1c = max(0, min(h - 1, y1))
+            x2c = max(0, min(w - 1, x2))
+            y2c = max(0, min(h - 1, y2))
+
+            mask = (u_pix >= x1c) & (u_pix <= x2c) & (v_pix >= y1c) & (v_pix <= y2c)
+            if np.count_nonzero(mask) == 0:
+                continue
+
+            selected_u = u_pix[mask]
+            selected_v = v_pix[mask]
+            selected_r = ranges[mask]
+
+            for idx in range(len(selected_u)):
+                cv2.circle(overlay, (int(selected_u[idx]), int(selected_v[idx])), 2, (255, 255, 255), -1)
+
+            if len(selected_r) > 0:
+                dist = float(np.mean(selected_r))
+                cv2.putText(overlay, f"dist:{dist:.2f}m", (x1c, max(0, y1c - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+            cv2.rectangle(overlay, (x1c, y1c), (x2c, y2c), (0, 255, 0), 2)
+
+        alpha = 0.45
+        cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, dst=img)
+
+    def _distance_to_color(self, dist: float) -> Tuple[int, int, int]:
+        if not np.isfinite(dist):
+            return (128, 128, 128)
+
+        # 가까울수록 초록/노랑, 멀수록 빨강/보라로 표현
+        if dist <= 1.0:
+            return (0, 255, 0)
+        if dist <= 3.0:
+            return (0, 255, 255)
+        if dist <= 6.0:
+            return (0, 165, 255)
+        return (255, 0, 0)
 
     def project_scan_to_image(self, scan_msg: LaserScan, img_w: int, img_h: int):
         ranges = np.asarray(scan_msg.ranges, dtype=np.float64)
@@ -343,18 +473,96 @@ class FusionVisualizerNode(Node):
         uu = u[mask]
         vv = v[mask]
 
-        if self.distance_method == 'min':
-            idx = int(np.argmin(r))
-            dist = float(r[idx])
-        elif self.distance_method == 'median':
-            dist = float(np.median(r))
-            idx = int(np.argmin(np.abs(r - dist)))
-        else:
-            dist = float(np.percentile(r, 20))
-            idx = int(np.argmin(np.abs(r - dist)))
+        filtered = self._filter_front_points(r, uu, vv, x1, y1, x2, y2)
+        if filtered is None:
+            return None, None
 
-        best_uv = (int(uu[idx]), int(vv[idx]))
+        candidate_r, candidate_u, candidate_v = filtered
+        if len(candidate_r) == 0:
+            return None, None
+
+        if self.distance_method == 'min':
+            idx = int(np.argmin(candidate_r))
+            dist = float(candidate_r[idx])
+            best_uv = (int(candidate_u[idx]), int(candidate_v[idx]))
+            return dist, best_uv
+
+        if self.distance_method == 'median':
+            dist = float(np.median(candidate_r))
+            idx = int(np.argmin(np.abs(candidate_r - dist)))
+            best_uv = (int(candidate_u[idx]), int(candidate_v[idx]))
+            return dist, best_uv
+
+        if self.distance_method == 'p20':
+            dist = float(np.percentile(candidate_r, 20))
+            idx = int(np.argmin(np.abs(candidate_r - dist)))
+            best_uv = (int(candidate_u[idx]), int(candidate_v[idx]))
+            return dist, best_uv
+
+        # center: bbox 중심에 가깝고, 앞쪽(더 짧은 거리) 포인트들을 우선적으로 사용
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        center_deltas = np.sqrt((candidate_u - cx) ** 2 + (candidate_v - cy) ** 2)
+        center_order = np.argsort(center_deltas)
+        sorted_r = candidate_r[center_order]
+        sorted_u = candidate_u[center_order]
+        sorted_v = candidate_v[center_order]
+
+        # 오차 허용 범위 안에 있는 포인트들을 묶어서 평균 사용
+        if len(sorted_r) >= 1:
+            base_dist = float(sorted_r[0])
+            tolerance = max(self.distance_tolerance, 1e-3)
+            close_mask = np.abs(sorted_r - base_dist) <= tolerance
+            if np.count_nonzero(close_mask) == 0:
+                close_mask = np.ones_like(sorted_r, dtype=bool)
+
+            selected_r = sorted_r[close_mask]
+            selected_u = sorted_u[close_mask]
+            selected_v = sorted_v[close_mask]
+
+            if len(selected_r) >= 1:
+                dist = float(np.mean(selected_r))
+                best_uv = (int(np.mean(selected_u)), int(np.mean(selected_v)))
+                return dist, best_uv
+
+        idx = int(np.argmin(sorted_r))
+        dist = float(sorted_r[idx])
+        best_uv = (int(sorted_u[idx]), int(sorted_v[idx]))
         return dist, best_uv
+
+    def _filter_front_points(self, r, u, v, x1, y1, x2, y2):
+        if len(r) == 0:
+            return None
+
+        valid_mask = np.isfinite(r) & (r >= self.min_range) & (r <= self.max_range)
+        if np.count_nonzero(valid_mask) == 0:
+            return None
+
+        r_valid = r[valid_mask]
+        u_valid = u[valid_mask]
+        v_valid = v[valid_mask]
+
+        if len(r_valid) == 0:
+            return None
+
+        # 박스 중심 기준으로 앞쪽에 있는 포인트만 남김
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        center_deltas = np.sqrt((u_valid - cx) ** 2 + (v_valid - cy) ** 2)
+        center_order = np.argsort(center_deltas)
+
+        ordered_r = r_valid[center_order]
+        ordered_u = u_valid[center_order]
+        ordered_v = v_valid[center_order]
+
+        # 가까운 포인트를 우선적으로 사용하되, 너무 멀리 있는 배경 포인트는 제외
+        base_dist = float(np.min(ordered_r))
+        tolerance = max(self.distance_tolerance, 1e-3)
+        close_mask = np.abs(ordered_r - base_dist) <= tolerance
+        if np.count_nonzero(close_mask) == 0:
+            close_mask = np.ones_like(ordered_r, dtype=bool)
+
+        return ordered_r[close_mask], ordered_u[close_mask], ordered_v[close_mask]
 
 
 def main(args=None):
