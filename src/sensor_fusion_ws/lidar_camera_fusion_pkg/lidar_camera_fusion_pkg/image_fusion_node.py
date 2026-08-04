@@ -152,7 +152,9 @@ class FusionVisualizerNode(Node):
             self.pub_img = None
 
         if self.display:
-            cv2.namedWindow("Fusion Visualizer", cv2.WINDOW_NORMAL)
+            cv2.namedWindow("Fusion Visualizer - Full Cloud", cv2.WINDOW_NORMAL)
+            if self.show_split_view:
+                cv2.namedWindow("Fusion Visualizer - Overlap View", cv2.WINDOW_NORMAL)
 
         # 디버그 타이머: 데이터 미수신 상태를 주기적으로 알려줌
         self.create_timer(1.0, self.debug_timer)
@@ -284,8 +286,12 @@ class FusionVisualizerNode(Node):
 
         if scan_ok:
             u_pix, v_pix, ranges = self.project_scan_to_image(self.last_scan, w, h)
-            if self.show_split_view:
-                self.draw_projected_points(img, u_pix, v_pix, ranges)
+
+        full_view = img.copy()
+        overlap_view = img.copy()
+
+        if scan_ok:
+            self.draw_projected_points(full_view, u_pix, v_pix, ranges)
 
         # 4) detections overlay + distance
         if det_ok:
@@ -321,29 +327,30 @@ class FusionVisualizerNode(Node):
                 else:
                     color = (0, 255, 0) if is_person else (255, 0, 0)
 
-                cv2.rectangle(img, (x1c, y1c), (x2c, y2c), color, 2)
-
                 if dist_m is None:
                     text = f"{class_name} {score:.2f}  dist:N/A"
                 else:
                     text = f"{class_name} {score:.2f}  dist:{dist_m:.2f}m"
 
-                cv2.putText(img, text, (x1c, max(0, y1c - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+                self._draw_box_with_label(full_view, x1c, y1c, x2c, y2c, color, text, best_uv)
 
-                if best_uv is not None:
-                    cv2.circle(img, best_uv, 4, (255, 255, 255), -1)
+                if self.show_split_view and scan_ok:
+                    self._draw_box_with_label(overlap_view, x1c, y1c, x2c, y2c, color, text, best_uv)
 
         if self.show_split_view and scan_ok and det_ok:
-            self.draw_split_view(img, w, h, u_pix, v_pix, ranges, self.last_det.detections)
+            self.draw_split_view(overlap_view, w, h, u_pix, v_pix, ranges, self.last_det.detections)
 
         # 5) show / publish
         if self.display:
-            cv2.imshow("Fusion Visualizer", img)
+            if self.show_split_view and scan_ok and det_ok:
+                cv2.imshow("Fusion Visualizer - Full Cloud", full_view)
+                cv2.imshow("Fusion Visualizer - Overlap View", overlap_view)
+            else:
+                cv2.imshow("Fusion Visualizer - Full Cloud", full_view)
             cv2.waitKey(1)
 
         if self.pub_img is not None:
-            out_msg = self.bridge.cv2_to_imgmsg(img, encoding='bgr8')
+            out_msg = self.bridge.cv2_to_imgmsg(full_view, encoding='bgr8')
             out_msg.header = Header()
             out_msg.header.stamp = img_msg.header.stamp
             out_msg.header.frame_id = img_msg.header.frame_id
@@ -368,7 +375,6 @@ class FusionVisualizerNode(Node):
         if len(u_pix) == 0 or len(detections) == 0:
             return
 
-        overlay = img.copy()
         for det in detections:
             bbox = det.bbox
             box_cx = float(bbox.center.position.x)
@@ -395,17 +401,46 @@ class FusionVisualizerNode(Node):
             selected_r = ranges[mask]
 
             for idx in range(len(selected_u)):
-                cv2.circle(overlay, (int(selected_u[idx]), int(selected_v[idx])), 2, (255, 255, 255), -1)
+                cv2.circle(img, (int(selected_u[idx]), int(selected_v[idx])), 2, (255, 255, 255), -1)
 
             if len(selected_r) > 0:
                 dist = float(np.mean(selected_r))
-                cv2.putText(overlay, f"dist:{dist:.2f}m", (x1c, max(0, y1c - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                text = f"dist:{dist:.2f}m"
+                self._draw_box_with_label(img, x1c, y1c, x2c, y2c, (0, 255, 0), text, None)
+            else:
+                self._draw_box_with_label(img, x1c, y1c, x2c, y2c, (0, 165, 255), "dist:N/A", None)
 
-            cv2.rectangle(overlay, (x1c, y1c), (x2c, y2c), (0, 255, 0), 2)
+    def _draw_box_with_label(self, img, x1, y1, x2, y2, color, text, best_uv):
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
 
-        alpha = 0.45
-        cv2.addWeighted(overlay, alpha, img, 1.0 - alpha, 0, dst=img)
+        text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        label_x, label_y = self._compute_distance_label_position(
+            x1, y1, x2, y2, text_size[0], text_size[1], img.shape[1], img.shape[0]
+        )
+
+        cv2.rectangle(
+            img,
+            (label_x - 2, label_y - text_size[1] - 2),
+            (label_x + text_size[0] + 2, label_y + 2),
+            (0, 0, 0),
+            -1,
+        )
+        cv2.putText(img, text, (label_x, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+
+        if best_uv is not None:
+            cv2.circle(img, best_uv, 4, (255, 255, 255), -1)
+
+    def _compute_distance_label_position(self, x1, y1, x2, y2, text_w, text_h, img_w, img_h):
+        margin_x = 6
+        margin_y = 8
+        top_left = (max(0, x1 + margin_x), max(0, y1 + margin_y))
+        top_right = (min(max(0, img_w - text_w - 1), max(0, x2 - text_w - margin_x)), max(0, y1 + margin_y))
+
+        if top_left[0] + text_w <= min(img_w - 1, x2 - margin_x):
+            return top_left
+        if top_right[0] >= max(0, x1 + margin_x):
+            return top_right
+        return top_left
 
     def _distance_to_color(self, dist: float) -> Tuple[int, int, int]:
         if not np.isfinite(dist):
