@@ -30,7 +30,8 @@ IMAGE_DIRECTORY_PATH = 'src/camera_perception_pkg/camera_perception_pkg/lib/Coll
 VIDEO_FILE_PATH = 'src/camera_perception_pkg/camera_perception_pkg/lib/Collected_Datasets/driving_simulation.mp4'
 
 # 화면에 publish하는 이미지를 띄울것인지 여부: True, 또는 False 중 택1하여 입력
-SHOW_IMAGE = True
+# Fusion Visualizer 창이 이미 카메라 영상을 보여주므로 기본은 False (중복 imshow 오버헤드 제거)
+SHOW_IMAGE = False
 
 # 이미지 발행 주기 (초) - 소수점 필요 (int형은 반영되지 않음)
 TIMER = 0.03

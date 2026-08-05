@@ -98,6 +98,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'cam_num': cam_num,
+                'logger': False,
             }],
         ),
 

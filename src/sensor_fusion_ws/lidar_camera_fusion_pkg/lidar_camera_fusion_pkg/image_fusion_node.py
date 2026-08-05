@@ -32,13 +32,15 @@ class FusionVisualizerNode(Node):
         # -------------------------
         # Topics
         # -------------------------
-        self.declare_parameter('image_topic', '/camera1/image_raw')
+        self.declare_parameter('image_topic', '/image_raw')
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('det_topic', '/detections')
 
         self.declare_parameter('publish_annotated', False)
         self.declare_parameter('annotated_topic', '/fusion/annotated_image')
         self.declare_parameter('display', True)
+        self.declare_parameter('window_width', 960)
+        self.declare_parameter('window_height', 720)
 
         # -------------------------
         # Intrinsic
@@ -86,6 +88,8 @@ class FusionVisualizerNode(Node):
         self.publish_annotated = bool(self.get_parameter('publish_annotated').value)
         self.annotated_topic = self.get_parameter('annotated_topic').value
         self.display = bool(self.get_parameter('display').value)
+        self.window_width = int(self.get_parameter('window_width').value)
+        self.window_height = int(self.get_parameter('window_height').value)
 
         fx = float(self.get_parameter('fx').value)
         fy = float(self.get_parameter('fy').value)
@@ -148,8 +152,10 @@ class FusionVisualizerNode(Node):
 
         if self.display:
             cv2.namedWindow("Fusion Visualizer - Full Cloud", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Fusion Visualizer - Full Cloud", self.window_width, self.window_height)
             if self.show_split_view:
                 cv2.namedWindow("Fusion Visualizer - Boxes Only", cv2.WINDOW_NORMAL)
+                cv2.resizeWindow("Fusion Visualizer - Boxes Only", self.window_width, self.window_height)
 
         # 디버그 타이머: 데이터 미수신 상태를 주기적으로 알려줌
         self.create_timer(1.0, self.debug_timer)
@@ -356,7 +362,7 @@ class FusionVisualizerNode(Node):
 
             u = int(u_pix[idx])
             v = int(v_pix[idx])
-            cv2.circle(img, (u, v), 1, (0, 255, 255), -1)
+            cv2.circle(img, (u, v), 2, (0, 0, 255), -1)
 
     def _draw_box_with_label(self, img, x1, y1, x2, y2, color, text, best_uv):
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
