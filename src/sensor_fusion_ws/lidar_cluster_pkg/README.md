@@ -70,3 +70,9 @@ ros2 launch lidar_cluster_pkg l_shape_bringup.launch.py
 인자(필요할 때만 덮어쓰기): `serial_port`(기본 `/dev/ttyUSB0`), `serial_baudrate`(기본 `460800`, C1 기준),
 `frame_id`(기본 `laser`), `front_angle_deg`(기본 `180.0`), `fov_deg`(기본 `150.0`),
 `launch_rviz`(기본 `true`).
+
+⚠️ `fusion_bringup.launch.py`와 동시에 실행하지 말 것 — 둘 다 자체 `rplidar_node`를 띄우는데, 같은
+시리얼 포트(`/dev/ttyUSB0`)는 프로세스 하나만 점유할 수 있어서 나중에 뜬 쪽의 라이다 드라이버가 포트를
+못 열어 `/scan`을 못 받는다(카메라·YOLO 등 나머지는 정상 동작하는 것처럼 보여서 원인 파악이 어려움).
+퓨전과 L-shape을 동시에 쓰려면 `sensor_fusion_bringup` 패키지의 `full_bringup.launch.py`를 사용한다
+(여러 서브시스템을 한 번에 묶어서 켜는 launch는 이 패키지가 아니라 그쪽에 모아둔다).

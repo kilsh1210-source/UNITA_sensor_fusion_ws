@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<?xml-stylesheet type="text/xsl" href="http://download.ros.org/schema/package_format3.xsd"?>
+<package format="3">
+  <name>sensor_fusion_bringup</name>
+  <version>0.0.1</version>
+  <description>여러 서브시스템(카메라-라이다 퓨전, L-shape, 추후 bird's eye view 등)을 한 번에 묶어서
+    실행하는 최상위 launch 모음 패키지</description>
+  <maintainer email="ros2kil105@gmail.com">kil</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>lidar_camera_fusion_pkg</exec_depend>
+  <exec_depend>lidar_cluster_pkg</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
