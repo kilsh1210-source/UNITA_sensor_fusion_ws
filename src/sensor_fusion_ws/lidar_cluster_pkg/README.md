@@ -2,7 +2,9 @@
 
 라이다 스캔에서 물체 덩어리(클러스터)를 찾아 RViz에서 시각화하는 패키지. 카메라와는 무관하게 라이다
 데이터만으로 "주변에 뭐가 몇 개 있는지" 확인하고 싶을 때 쓰는 디버깅/시각화용 도구.
-`fusion_bringup.launch.py`에는 포함되어 있지 않으며, 필요할 때 따로 실행한다.
+`lidar_camera_fusion_pkg`의 `fusion_bringup.launch.py`에는 포함되어 있지 않으며, 필요할 때 따로
+실행한다. 두 노드(`scan_cluster_node`, `l_shape_node`) 모두 클러스터링 로직은 `clustering_utils.py`를
+공유한다.
 
 ## 노드
 
@@ -22,7 +24,8 @@
   - `point_size`, `centroid_size`, `text_size`: RViz 마커 크기
 
 RViz에서 `MarkerArray` 디스플레이를 `/lidar_clusters` 토픽으로 추가하고 Fixed Frame을 `frame_id`(기본
-`laser`)와 맞추면 클러스터가 보인다.
+`laser`)와 맞추면 클러스터가 보인다. 이 노드는 전용 launch 파일이 없으므로 라이다 드라이버(`rplidar_node`
+등)와 `rviz2`를 직접 따로 실행해야 한다.
 
 ### `l_shape_node`
 
