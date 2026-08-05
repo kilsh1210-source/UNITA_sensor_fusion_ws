@@ -34,8 +34,8 @@ class SensorFusionNode(Node):
         # 카메라 내부파라미터 (실측 캘리브레이션 값). 선형 FOV 근사 대신 정확한 핀홀 투영
         # angle = atan((pixel_x - cx) / fx) 으로 픽셀→각도 변환을 하기 위해 필요.
         # 카메라를 바꾸면 재캘리브레이션 후 launch 인자 fx/cx로 값을 갱신할 것
-        self.declare_parameter("fx", 559.431712)
-        self.declare_parameter("cx", 302.888725)
+        self.declare_parameter("fx", 565.529459)
+        self.declare_parameter("cx", 337.983746)
 
         # 라이다가 인식하는 정면 방향이 실제 원하는 정면과 반대일 때 보정값(도).
         # 라이다 장착 방향에 맞게 launch 인자 lidar_front_offset_deg로 

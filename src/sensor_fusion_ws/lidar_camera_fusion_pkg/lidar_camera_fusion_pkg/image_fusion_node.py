@@ -45,16 +45,16 @@ class FusionVisualizerNode(Node):
         # -------------------------
         # Intrinsic
         # -------------------------
-        self.declare_parameter('fx', 559.431712)
-        self.declare_parameter('fy', 568.785249)
-        self.declare_parameter('cx', 302.888725)
-        self.declare_parameter('cy', 329.408991)
+        self.declare_parameter('fx', 565.529459)
+        self.declare_parameter('fy', 566.767111)
+        self.declare_parameter('cx', 337.983746)
+        self.declare_parameter('cy', 290.095566)
 
         # -------------------------
         # Extrinsic (LiDAR -> Camera)
         # -------------------------
         self.declare_parameter('cam_x_offset', 0.0)
-        self.declare_parameter('cam_height', 0.064)
+        self.declare_parameter('cam_height', 0.032)
         self.declare_parameter('use_urdf_extrinsic', True)
         self.declare_parameter('lidar_frame_id', 'laser')
         self.declare_parameter('camera_frame_id', 'camera_link')
