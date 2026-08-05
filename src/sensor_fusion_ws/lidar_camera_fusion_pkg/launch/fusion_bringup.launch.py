@@ -117,19 +117,21 @@ def generate_launch_description():
         # LiDAR-Camera fusion (distance overlay)
         Node(
             package='lidar_camera_fusion_pkg',
-            executable='sensor_fusion_node',
-            name='sensor_fusion_node',
+            executable='image_fusion_node',
+            name='image_fusion_node',
             output='screen',
             parameters=[{
                 'fx': fx,
                 'cx': cx,
-                'lidar_front_offset_deg': lidar_front_offset_deg,
+                'front_angle_deg': lidar_front_offset_deg,
                 'show_split_view': show_split_view,
                 'draw_all_points': draw_all_points,
                 'distance_tolerance': distance_tolerance,
                 'use_urdf_extrinsic': use_urdf_extrinsic,
                 'lidar_frame_id': lidar_frame_id,
                 'camera_frame_id': camera_frame_id,
+                'display': True,
+                'publish_annotated': False,
             }],
         ),
     ])
