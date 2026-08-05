@@ -3,6 +3,9 @@
 /install/
 /log/
 
+# 워크스페이스 루트 유틸리티 스크립트 (빌드 대상 아님, 개인용 도구)
+/scripts/
+
 # VS Code
 /.vscode/
 
