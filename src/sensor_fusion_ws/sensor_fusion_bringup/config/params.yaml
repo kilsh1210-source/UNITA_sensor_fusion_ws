@@ -1,0 +1,62 @@
+# full_bringup.launch.py 에서 쓰는 파라미터 모음.
+#
+# - rplidar_node / image_publisher_node / yolov8_node / image_fusion_node 값은
+#   fusion_bringup.launch.py(별도 패키지)로 전달되는 launch 인자의 "기본값"으로만 쓰인다.
+#   (그 launch 파일을 단독 실행할 때는 이 파일과 무관하게 자체 기본값이 적용됨)
+# - l_shape_node는 여기서 직접 실행하므로 전체 파라미터가 그대로 로드된다.
+#
+# 값을 바꾸려면 이 파일만 고치면 되고, launch 인자로 여전히 임시 override도 가능
+# (예: ros2 launch sensor_fusion_bringup full_bringup.launch.py fov_deg:=120.0)
+
+rplidar_node:
+  ros__parameters:
+    serial_port: /dev/ttyUSB0
+    serial_baudrate: 460800
+    frame_id: &frame_id laser
+
+image_publisher_node:
+  ros__parameters:
+    cam_num: 0
+
+yolov8_node:
+  ros__parameters:
+    device: cpu
+
+image_fusion_node:
+  ros__parameters:
+    # 카메라 내부파라미터(캘리브레이션 값)
+    fx: 565.529459
+    cx: 337.983746
+    # 라이다 정면 방향 보정(도). l_shape_node의 front_angle_deg에도 동일 적용.
+    front_angle_deg: &front_angle_deg -180.0
+    show_split_view: true
+    distance_tolerance: 0.6
+    draw_all_points: true
+    use_urdf_extrinsic: false
+    lidar_frame_id: *frame_id
+    camera_frame_id: camera_link
+
+l_shape_node:
+  ros__parameters:
+    scan_topic: /scan
+    marker_topic: /l_shape_boxes
+    frame_id: *frame_id
+
+    cluster_tolerance: 0.12    # [m] 인접 포인트 연결 기준
+    min_cluster_size: 6
+    max_cluster_size: 400
+    max_range: 6.0             # [m]
+
+    front_angle_deg: *front_angle_deg
+    fov_deg: 150.0             # front_angle_deg 중심으로 남길 시야각(도)
+
+    theta_resolution_deg: 1.0
+    min_points_for_fit: 4
+
+    rect_line_width: 0.02
+    show_heading_arrow: true
+    arrow_length: 0.3
+    show_text: true
+    text_size: 0.15
+
+    launch_rviz: true

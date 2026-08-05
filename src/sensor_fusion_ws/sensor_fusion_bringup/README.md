@@ -24,3 +24,16 @@ ros2 launch sensor_fusion_bringup full_bringup.launch.py
 `draw_all_points`, `use_urdf_extrinsic`, `lidar_frame_id`, `camera_frame_id`)에 `fov_deg`(기본 `150.0`),
 `launch_rviz`(기본 `true`)가 추가된 것과 동일하다. `lidar_front_offset_deg`는 퓨전의 좌표 변환과
 `l_shape_node`의 `front_angle_deg`에 동시에 적용된다.
+
+## config/params.yaml
+
+위 launch 인자들의 기본값은 전부 `config/params.yaml` 하나에서 온다. 값을 바꾸고 싶으면(예: 카메라
+재캘리브레이션으로 fx/cx가 바뀌었을 때) 이 파일만 고치면 되고, 필요하면 여전히 launch 인자로 그때그때
+override할 수 있다(`ros2 launch sensor_fusion_bringup full_bringup.launch.py fov_deg:=120.0`).
+
+`l_shape_node`는 이 launch 파일이 직접 실행하는 노드라 `config/params.yaml`을 통째로 로드한다 —
+`cluster_tolerance`, `min_cluster_size`, `rect_line_width` 등 launch 인자로는 노출되지 않는 세부
+파라미터까지 전부 여기서 관리된다. 반면 `rplidar_node`/`image_publisher_node`/`yolov8_node`/
+`image_fusion_node`는 `fusion_bringup.launch.py`가 별도 패키지에서 소유하고 있어서, 이 YAML의 값은
+그 launch 파일로 전달되는 인자의 "기본값"으로만 쓰인다 (전체 파라미터를 다 노출하려면
+`fusion_bringup.launch.py` 자체를 손봐야 함).

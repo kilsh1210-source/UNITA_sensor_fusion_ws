@@ -1,5 +1,7 @@
 import os
 
+import yaml
+
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
@@ -9,25 +11,45 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
+    # 모든 기본값은 config/params.yaml 하나로 관리. 값을 바꾸려면 그 파일을 수정할 것
+    # (launch 인자로 임시 override도 여전히 가능).
+    config_file = os.path.join(
+        get_package_share_directory('sensor_fusion_bringup'),
+        'config', 'params.yaml'
+    )
+    with open(config_file) as f:
+        params = yaml.safe_load(f)
+
+    rplidar_p = params['rplidar_node']['ros__parameters']
+    cam_p = params['image_publisher_node']['ros__parameters']
+    yolo_p = params['yolov8_node']['ros__parameters']
+    fusion_p = params['image_fusion_node']['ros__parameters']
+    l_shape_p = params['l_shape_node']['ros__parameters']
+
     # --- fusion_bringup.launch.py 인자 (그대로 전달) ---
-    serial_port = LaunchConfiguration('serial_port', default='/dev/ttyUSB0')
-    serial_baudrate = LaunchConfiguration('serial_baudrate', default='460800')
-    frame_id = LaunchConfiguration('frame_id', default='laser')
-    device = LaunchConfiguration('device', default='cpu')
-    fx = LaunchConfiguration('fx', default='565.529459')
-    cx = LaunchConfiguration('cx', default='337.983746')
-    lidar_front_offset_deg = LaunchConfiguration('lidar_front_offset_deg', default='-180.0')
-    cam_num = LaunchConfiguration('cam_num', default='0')
-    show_split_view = LaunchConfiguration('show_split_view', default='true')
-    distance_tolerance = LaunchConfiguration('distance_tolerance', default='0.6')
-    draw_all_points = LaunchConfiguration('draw_all_points', default='true')
-    use_urdf_extrinsic = LaunchConfiguration('use_urdf_extrinsic', default='false')
-    lidar_frame_id = LaunchConfiguration('lidar_frame_id', default='laser')
-    camera_frame_id = LaunchConfiguration('camera_frame_id', default='camera_link')
+    serial_port = LaunchConfiguration('serial_port', default=str(rplidar_p['serial_port']))
+    serial_baudrate = LaunchConfiguration('serial_baudrate', default=str(rplidar_p['serial_baudrate']))
+    frame_id = LaunchConfiguration('frame_id', default=str(rplidar_p['frame_id']))
+    device = LaunchConfiguration('device', default=str(yolo_p['device']))
+    fx = LaunchConfiguration('fx', default=str(fusion_p['fx']))
+    cx = LaunchConfiguration('cx', default=str(fusion_p['cx']))
+    lidar_front_offset_deg = LaunchConfiguration(
+        'lidar_front_offset_deg', default=str(fusion_p['front_angle_deg']))
+    cam_num = LaunchConfiguration('cam_num', default=str(cam_p['cam_num']))
+    show_split_view = LaunchConfiguration(
+        'show_split_view', default=str(fusion_p['show_split_view']).lower())
+    distance_tolerance = LaunchConfiguration(
+        'distance_tolerance', default=str(fusion_p['distance_tolerance']))
+    draw_all_points = LaunchConfiguration(
+        'draw_all_points', default=str(fusion_p['draw_all_points']).lower())
+    use_urdf_extrinsic = LaunchConfiguration(
+        'use_urdf_extrinsic', default=str(fusion_p['use_urdf_extrinsic']).lower())
+    lidar_frame_id = LaunchConfiguration('lidar_frame_id', default=str(fusion_p['lidar_frame_id']))
+    camera_frame_id = LaunchConfiguration('camera_frame_id', default=str(fusion_p['camera_frame_id']))
 
     # --- l_shape_node 전용 인자 ---
-    fov_deg = LaunchConfiguration('fov_deg', default='150.0')
-    launch_rviz = LaunchConfiguration('launch_rviz', default='true')
+    fov_deg = LaunchConfiguration('fov_deg', default=str(l_shape_p['fov_deg']))
+    launch_rviz = LaunchConfiguration('launch_rviz', default=str(l_shape_p['launch_rviz']).lower())
 
     fusion_launch_path = os.path.join(
         get_package_share_directory('lidar_camera_fusion_pkg'), 'launch', 'fusion_bringup.launch.py'
@@ -91,12 +113,13 @@ def generate_launch_description():
         ),
 
         # L-shape fitting (같은 /scan을 구독만 하므로 별도 rplidar_node 없음)
+        # config/params.yaml 전체를 로드하고, launch 인자로만 일부 값을 override
         Node(
             package='lidar_cluster_pkg',
             executable='l_shape_node',
             name='l_shape_node',
             output='screen',
-            parameters=[{
+            parameters=[config_file, {
                 'frame_id': frame_id,
                 'front_angle_deg': lidar_front_offset_deg,
                 'fov_deg': fov_deg,
