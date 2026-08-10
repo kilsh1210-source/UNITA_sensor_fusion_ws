@@ -22,6 +22,7 @@ class BirdEyeNode(Node):
 
         self.declare_parameter('input_topic', 'image_raw')
         self.declare_parameter('output_topic', 'bird_eye/image')
+        self.declare_parameter('roi_topic', 'bird_eye/roi')
         self.declare_parameter('comparison_topic', 'bird_eye/comparison')
         self.declare_parameter('output_width', 640)
         self.declare_parameter('output_height', 640)
@@ -50,6 +51,7 @@ class BirdEyeNode(Node):
 
         self.input_topic = self.get_parameter('input_topic').value
         self.output_topic = self.get_parameter('output_topic').value
+        self.roi_topic = self.get_parameter('roi_topic').value
         self.comparison_topic = self.get_parameter('comparison_topic').value
         self.output_width = int(self.get_parameter('output_width').value)
         self.output_height = int(self.get_parameter('output_height').value)
@@ -89,13 +91,14 @@ class BirdEyeNode(Node):
 
         qos = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.RELIABLE)
         self.publisher = self.create_publisher(Image, self.output_topic, qos)
+        self.roi_publisher = self.create_publisher(Image, self.roi_topic, qos)
         self.comparison_publisher = self.create_publisher(
             Image, self.comparison_topic, qos)
         self.subscription = self.create_subscription(
             Image, self.input_topic, self.image_callback, qos)
         self.get_logger().info(
             f'Single-camera lane bird-eye: {self.input_topic} -> '
-            f'{self.output_topic}, {self.comparison_topic}')
+            f'{self.output_topic}, {self.roi_topic}, {self.comparison_topic}')
 
     def _validate_parameters(self) -> None:
         if len(self.src_points) != 8:
@@ -370,6 +373,10 @@ class BirdEyeNode(Node):
         self.publisher.publish(bird_eye_message)
 
         original_view = self._draw_roi_on_original(frame)
+        roi_message = self.bridge.cv2_to_imgmsg(original_view, encoding='bgr8')
+        roi_message.header = message.header
+        self.roi_publisher.publish(roi_message)
+
         original_panel = self._fit_to_panel(
             original_view, self.output_width, self.output_height)
         comparison = np.hstack((

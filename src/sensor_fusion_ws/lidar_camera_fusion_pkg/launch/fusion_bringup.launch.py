@@ -11,7 +11,7 @@ def generate_launch_description():
     serial_port = LaunchConfiguration('serial_port', default='/dev/ttyUSB0')
     serial_baudrate = LaunchConfiguration('serial_baudrate', default='460800')
     frame_id = LaunchConfiguration('frame_id', default='laser')
-    device = LaunchConfiguration('device', default='cpu')
+    device = LaunchConfiguration('device', default='cuda:0')
     fx = LaunchConfiguration('fx', default='565.529459')
     cx = LaunchConfiguration('cx', default='337.983746')
     lidar_front_offset_deg = LaunchConfiguration('lidar_front_offset_deg', default='-180.0')
@@ -120,7 +120,9 @@ def generate_launch_description():
             }],
         ),
 
-        # Bird's-eye lane view (Fusion Visualizer의 4번 화면에 표시됨)
+        # Bird's-eye lane view: bird_eye/image(버드아이뷰)는 Fusion Visualizer 4번,
+        # bird_eye/roi(ROI 표시된 원본)는 5번 화면으로 각각 전달됨.
+        # 자체 미리보기 창은 중복이라 꺼둠 (show_preview).
         Node(
             package='camera_perception_pkg',
             executable='bird_eye_node',
