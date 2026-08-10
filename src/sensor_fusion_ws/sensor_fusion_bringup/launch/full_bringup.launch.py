@@ -36,8 +36,8 @@ def generate_launch_description():
     lidar_front_offset_deg = LaunchConfiguration(
         'lidar_front_offset_deg', default=str(fusion_p['front_angle_deg']))
     cam_num = LaunchConfiguration('cam_num', default=str(cam_p['cam_num']))
-    show_split_view = LaunchConfiguration(
-        'show_split_view', default=str(fusion_p['show_split_view']).lower())
+    display_mode = LaunchConfiguration(
+        'display_mode', default=str(fusion_p['display_mode']))
     distance_tolerance = LaunchConfiguration(
         'distance_tolerance', default=str(fusion_p['distance_tolerance']))
     draw_all_points = LaunchConfiguration(
@@ -53,6 +53,9 @@ def generate_launch_description():
 
     fusion_launch_path = os.path.join(
         get_package_share_directory('lidar_camera_fusion_pkg'), 'launch', 'fusion_bringup.launch.py'
+    )
+    description_launch_path = os.path.join(
+        get_package_share_directory('unita_minicar_description'), 'launch', 'description.launch.py'
     )
 
     return LaunchDescription([
@@ -74,8 +77,9 @@ def generate_launch_description():
                                            '동일하게 적용됨'),
         DeclareLaunchArgument('cam_num', default_value=cam_num,
                                description='카메라 장치 번호 (ls /dev/video* 로 확인)'),
-        DeclareLaunchArgument('show_split_view', default_value=show_split_view,
-                               description='전체 클라우드와 bbox-겹침 뷰를 함께 보여줄지 여부'),
+        DeclareLaunchArgument('display_mode', default_value=display_mode,
+                               description='Fusion Visualizer 시작 화면 모드: raw / lidar / boxes / bev '
+                                           '(창에서 숫자키 1~4로 실행 중 전환 가능)'),
         DeclareLaunchArgument('draw_all_points', default_value=draw_all_points,
                                description='카메라 위에 라이다 포인트를 전부 그릴지 여부'),
         DeclareLaunchArgument('distance_tolerance', default_value=distance_tolerance,
@@ -91,6 +95,12 @@ def generate_launch_description():
         DeclareLaunchArgument('launch_rviz', default_value=launch_rviz,
                                description='l_shape_node가 시작될 때 rviz2를 자동으로 띄울지 여부'),
 
+        # 로봇 URDF 기반 TF (base_link -> laser / camera_link 등 고정 변환).
+        # image_fusion_node를 use_urdf_extrinsic:=true로 띄우면 이 TF를 읽어서 외인척 변환에 사용함
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(description_launch_path),
+        ),
+
         # 라이다 드라이버 + 카메라 + YOLO + 퓨전 (rplidar_node는 여기서 한 번만 실행됨)
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(fusion_launch_path),
@@ -103,7 +113,7 @@ def generate_launch_description():
                 'cx': cx,
                 'lidar_front_offset_deg': lidar_front_offset_deg,
                 'cam_num': cam_num,
-                'show_split_view': show_split_view,
+                'display_mode': display_mode,
                 'distance_tolerance': distance_tolerance,
                 'draw_all_points': draw_all_points,
                 'use_urdf_extrinsic': use_urdf_extrinsic,

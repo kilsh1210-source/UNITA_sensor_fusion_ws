@@ -19,11 +19,36 @@ from std_msgs.msg import Header
 from interfaces_pkg.msg import DetectionArray
 
 
+WINDOW_NAME = 'Fusion Visualizer'
+
+# 숫자 키: 주 화면 전환 / q,w,e,r 키: 보조 화면(분할뷰) 전환
+MODE_KEYS = {
+    ord('1'): 'raw',
+    ord('2'): 'lidar',
+    ord('3'): 'boxes',
+    ord('4'): 'bev',
+}
+SECONDARY_KEYS = {
+    ord('q'): 'raw',
+    ord('w'): 'lidar',
+    ord('e'): 'boxes',
+    ord('r'): 'bev',
+}
+MODE_LABELS = {
+    'raw': 'Raw Camera',
+    'lidar': 'LiDAR Points',
+    'boxes': 'Bounding Boxes',
+    'bev': "Bird's Eye View (TODO)",
+}
+
+
 class FusionVisualizerNode(Node):
     """
     - 동기화(message_filters) 제거: 이미지 콜백이 오면 무조건 화면 출력
     - 최신 LaserScan / DetectionArray가 있으면 오버레이
     - QoS는 sensor_data(BEST_EFFORT)로 고정 -> 카메라/라이다와 호환성 최대화
+    - 창 1개 + 숫자키(1~4)로 화면 모드 전환 (raw / lidar / boxes / bev)
+    - v: 분할뷰 토글, q/w/e/r: 분할뷰의 보조 화면 선택
     """
 
     def __init__(self):
@@ -72,7 +97,7 @@ class FusionVisualizerNode(Node):
 
         self.declare_parameter('point_stride', 1)       # 라이다 점 샘플링 간격 (1이면 전부 표시)
         self.declare_parameter('draw_all_points', True) # 카메라 이미지 위에 라이다 포인트를 전부 표시할지 여부
-        self.declare_parameter('show_split_view', True)  # 전체 클라우드 뷰와 bbox-겹침 전용 뷰를 함께 보여줄지 여부
+        self.declare_parameter('display_mode', 'boxes')  # 시작 화면 모드: raw / lidar / boxes / bev (창에서 숫자키 1~4로 전환)
         self.declare_parameter('distance_method', 'center')  # min / p20 / median / center
         self.declare_parameter('distance_tolerance', 0.6)    # 거리 오차 허용 범위 [m]
 
@@ -121,7 +146,12 @@ class FusionVisualizerNode(Node):
 
         self.point_stride = int(self.get_parameter('point_stride').value)
         self.draw_all_points = bool(self.get_parameter('draw_all_points').value)
-        self.show_split_view = bool(self.get_parameter('show_split_view').value)
+        self.mode = str(self.get_parameter('display_mode').value).lower().strip()
+        if self.mode not in MODE_LABELS:
+            self.get_logger().warn(f"Unknown display_mode '{self.mode}', falling back to 'boxes'")
+            self.mode = 'boxes'
+        self.secondary = 'lidar' if self.mode != 'lidar' else 'boxes'
+        self.split_view = False
         self.distance_method = str(self.get_parameter('distance_method').value).lower().strip()
         self.distance_tolerance = float(self.get_parameter('distance_tolerance').value)
 
@@ -151,16 +181,15 @@ class FusionVisualizerNode(Node):
             self.pub_img = None
 
         if self.display:
-            cv2.namedWindow("Fusion Visualizer - Full Cloud", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("Fusion Visualizer - Full Cloud", self.window_width, self.window_height)
-            if self.show_split_view:
-                cv2.namedWindow("Fusion Visualizer - Boxes Only", cv2.WINDOW_NORMAL)
-                cv2.resizeWindow("Fusion Visualizer - Boxes Only", self.window_width, self.window_height)
+            cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(WINDOW_NAME, self.window_width, self.window_height)
 
         # 디버그 타이머: 데이터 미수신 상태를 주기적으로 알려줌
         self.create_timer(1.0, self.debug_timer)
 
         self.get_logger().info(
+            "1:raw 2:lidar 3:boxes 4:bev (주화면) | q/w/e/r: 보조화면 | "
+            "v: 분할보기 토글 - 창을 클릭한 뒤 키 입력\n"
             f"FusionVisualizerNode started.\n"
             f"  image_topic={self.image_topic}\n"
             f"  scan_topic={self.scan_topic}\n"
@@ -281,75 +310,106 @@ class FusionVisualizerNode(Node):
             det_age = (now - self.last_det_time).nanoseconds / 1e9
             det_ok = (det_age <= self.max_age_det)
 
-        # 3) scan -> projected points
+        # 3) scan -> projected points (lidar/boxes 모드에서 사용)
+        needed_modes = {self.mode} | ({self.secondary} if self.split_view else set())
+
         u_pix = np.array([], dtype=np.int32)
         v_pix = np.array([], dtype=np.int32)
         ranges = np.array([], dtype=np.float64)
 
-        if scan_ok:
+        if scan_ok and (needed_modes & {'lidar', 'boxes'}):
             u_pix, v_pix, ranges = self.project_scan_to_image(self.last_scan, w, h)
 
-        full_view = img.copy()
-        overlap_view = img.copy()
+        # 4) 화면 모드별 프레임 생성 (분할뷰면 주+보조 2장, 아니면 주화면 1장)
+        display = self._render_mode(self.mode, img, w, h, scan_ok, det_ok, u_pix, v_pix, ranges)
 
-        if scan_ok:
-            self.draw_projected_points(full_view, u_pix, v_pix)
-
-        # 4) detections overlay + distance
-        if det_ok:
-            for det in self.last_det.detections:
-                class_name = getattr(det, 'class_name', 'Unknown')
-                score = float(getattr(det, 'score', 0.0))
-
-                bbox = det.bbox
-                box_cx = float(bbox.center.position.x)
-                box_cy = float(bbox.center.position.y)
-                bw = float(bbox.size.x)
-                bh = float(bbox.size.y)
-
-                x1 = int(box_cx - bw / 2.0)
-                y1 = int(box_cy - bh / 2.0)
-                x2 = int(box_cx + bw / 2.0)
-                y2 = int(box_cy + bh / 2.0)
-
-                x1c = max(0, min(w - 1, x1))
-                y1c = max(0, min(h - 1, y1))
-                x2c = max(0, min(w - 1, x2))
-                y2c = max(0, min(h - 1, y2))
-
-                dist_m, best_uv = (None, None)
-                if scan_ok and len(ranges) > 0:
-                    dist_m, best_uv = self.estimate_distance_in_bbox(
-                        u_pix, v_pix, ranges, x1c, y1c, x2c, y2c
-                    )
-
-                color = (0, 255, 0)
-
-                if dist_m is None:
-                    text = f"{class_name} {score:.2f}  dist:N/A"
-                else:
-                    text = f"{class_name} {score:.2f}  dist:{dist_m:.2f}m"
-
-                self._draw_box_with_label(full_view, x1c, y1c, x2c, y2c, color, text, best_uv)
-
-                if self.show_split_view:
-                    self._draw_box_with_label(overlap_view, x1c, y1c, x2c, y2c, color, text, best_uv)
+        if self.split_view:
+            secondary_frame = self._render_mode(
+                self.secondary, img, w, h, scan_ok, det_ok, u_pix, v_pix, ranges)
+            display = cv2.hconcat([display, secondary_frame])
 
         # 5) show / publish
         if self.display:
-            if self.show_split_view and det_ok:
-                cv2.imshow("Fusion Visualizer - Full Cloud", full_view)
-                cv2.imshow("Fusion Visualizer - Boxes Only", overlap_view)
-            else:
-                cv2.imshow("Fusion Visualizer - Full Cloud", full_view)
-            cv2.waitKey(1)
+            cv2.imshow(WINDOW_NAME, display)
+            key = cv2.waitKey(1) & 0xFF
+            if key in MODE_KEYS:
+                self.mode = MODE_KEYS[key]
+                self.get_logger().info(f'주화면: {self.mode}')
+            elif key in SECONDARY_KEYS:
+                self.secondary = SECONDARY_KEYS[key]
+                self.get_logger().info(f'보조화면: {self.secondary}')
+            elif key == ord('v'):
+                self.split_view = not self.split_view
+                self.get_logger().info(f'분할보기: {self.split_view}')
 
         if self.pub_img is not None:
-            out_msg = self.bridge.cv2_to_imgmsg(full_view, encoding='bgr8')
+            out_msg = self.bridge.cv2_to_imgmsg(display, encoding='bgr8')
             out_msg.header = Header()
             out_msg.header.stamp = img_msg.header.stamp
             out_msg.header.frame_id = img_msg.header.frame_id
             self.pub_img.publish(out_msg)
+
+    def _render_mode(self, mode, img, w, h, scan_ok, det_ok, u_pix, v_pix, ranges) -> np.ndarray:
+        if mode == 'raw':
+            frame = img.copy()
+
+        elif mode == 'lidar':
+            frame = img.copy()
+            if scan_ok:
+                self.draw_projected_points(frame, u_pix, v_pix)
+
+        elif mode == 'boxes':
+            frame = img.copy()
+            if det_ok:
+                for det in self.last_det.detections:
+                    class_name = getattr(det, 'class_name', 'Unknown')
+                    score = float(getattr(det, 'score', 0.0))
+
+                    bbox = det.bbox
+                    box_cx = float(bbox.center.position.x)
+                    box_cy = float(bbox.center.position.y)
+                    bw = float(bbox.size.x)
+                    bh = float(bbox.size.y)
+
+                    x1 = int(box_cx - bw / 2.0)
+                    y1 = int(box_cy - bh / 2.0)
+                    x2 = int(box_cx + bw / 2.0)
+                    y2 = int(box_cy + bh / 2.0)
+
+                    x1c = max(0, min(w - 1, x1))
+                    y1c = max(0, min(h - 1, y1))
+                    x2c = max(0, min(w - 1, x2))
+                    y2c = max(0, min(h - 1, y2))
+
+                    dist_m, best_uv = (None, None)
+                    if scan_ok and len(ranges) > 0:
+                        dist_m, best_uv = self.estimate_distance_in_bbox(
+                            u_pix, v_pix, ranges, x1c, y1c, x2c, y2c
+                        )
+
+                    color = (0, 255, 0)
+
+                    if dist_m is None:
+                        text = f"{class_name} {score:.2f}  dist:N/A"
+                    else:
+                        text = f"{class_name} {score:.2f}  dist:{dist_m:.2f}m"
+
+                    self._draw_box_with_label(frame, x1c, y1c, x2c, y2c, color, text, best_uv)
+
+        else:  # bev - 추후 구현 전까지는 자리만
+            frame = self._bev_placeholder(img.shape)
+
+        cv2.putText(frame, MODE_LABELS[mode], (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        return frame
+
+    @staticmethod
+    def _bev_placeholder(shape) -> np.ndarray:
+        h, w = shape[:2]
+        frame = np.zeros((h, w, 3), dtype=np.uint8)
+        cv2.putText(frame, "Bird's Eye View - TODO", (30, h // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+        return frame
 
     def draw_projected_points(self, img, u_pix, v_pix):
         if len(u_pix) == 0:

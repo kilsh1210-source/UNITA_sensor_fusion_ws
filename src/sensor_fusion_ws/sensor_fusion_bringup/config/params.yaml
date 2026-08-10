@@ -16,7 +16,7 @@ rplidar_node:
 
 image_publisher_node:
   ros__parameters:
-    cam_num: 0
+    cam_num: 2
 
 yolov8_node:
   ros__parameters:
@@ -29,12 +29,12 @@ image_fusion_node:
     cx: 337.983746
     # 라이다 정면 방향 보정(도). l_shape_node의 front_angle_deg에도 동일 적용.
     front_angle_deg: &front_angle_deg -180.0
-    show_split_view: true
+    display_mode: boxes       # raw / lidar / boxes / bev (창에서 숫자키 1~4로 실행 중 전환 가능)
     distance_tolerance: 0.6
     draw_all_points: true
-    use_urdf_extrinsic: false
+    use_urdf_extrinsic: true
     lidar_frame_id: *frame_id
-    camera_frame_id: camera_link
+    camera_frame_id: camera_link_tilted  # camera_link에서 -10도 다운틸트 보정된 프레임 (unita_minicar_description/launch/description.launch.py)
 
 l_shape_node:
   ros__parameters:

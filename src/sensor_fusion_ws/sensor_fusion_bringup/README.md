@@ -20,7 +20,7 @@ ros2 launch sensor_fusion_bringup full_bringup.launch.py
 ```
 
 인자는 `fusion_bringup.launch.py`의 모든 인자(`serial_port`, `serial_baudrate`, `frame_id`, `device`,
-`fx`, `cx`, `lidar_front_offset_deg`, `cam_num`, `show_split_view`, `distance_tolerance`,
+`fx`, `cx`, `lidar_front_offset_deg`, `cam_num`, `display_mode`, `distance_tolerance`,
 `draw_all_points`, `use_urdf_extrinsic`, `lidar_frame_id`, `camera_frame_id`)에 `fov_deg`(기본 `150.0`),
 `launch_rviz`(기본 `true`)가 추가된 것과 동일하다. `lidar_front_offset_deg`는 퓨전의 좌표 변환과
 `l_shape_node`의 `front_angle_deg`에 동시에 적용된다.

@@ -10,6 +10,7 @@
 
   <exec_depend>lidar_camera_fusion_pkg</exec_depend>
   <exec_depend>lidar_cluster_pkg</exec_depend>
+  <exec_depend>unita_minicar_description</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
 
   <test_depend>ament_copyright</test_depend>

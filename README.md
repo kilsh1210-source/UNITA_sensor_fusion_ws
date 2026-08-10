@@ -3,6 +3,7 @@
 카메라(YOLOv8) + 라이다(RPLIDAR C1)를 퓨전해서, 검출된 물체까지의 거리를 측정하는 ROS2(Humble) 워크스페이스.
 
 패키지별 상세 설명은 각 패키지의 README 참고:
+[`sensor_fusion_bringup`](src/sensor_fusion_ws/sensor_fusion_bringup/README.md) ·
 [`interfaces_pkg`](src/sensor_fusion_ws/interfaces_pkg/README.md) ·
 [`camera_perception_pkg`](src/sensor_fusion_ws/camera_perception_pkg/README.md) ·
 [`lidar_camera_fusion_pkg`](src/sensor_fusion_ws/lidar_camera_fusion_pkg/README.md) ·
@@ -64,10 +65,13 @@ groups   # 목록에 dialout 이 있어야 함
 
 ### 1-4. 확인한 번호를 실행 시 반영
 
-기본값(`cam_num:=0`, `serial_port:=/dev/ttyUSB0`)과 다르면, **소스를 고칠 필요 없이** launch 인자로 넘기면 된다:
+기본값과 다르면, **소스를 고칠 필요 없이** launch 인자로 그때그때 넘기거나
+[`config/params.yaml`](src/sensor_fusion_ws/sensor_fusion_bringup/config/params.yaml)의 값을 고쳐서 영구적으로 반영할 수 있다
+(단, `config/params.yaml`을 고친 뒤에는 `colcon build --packages-select sensor_fusion_bringup`을 다시 해야 `install/`에 반영됨 —
+symlink 설치가 아니라 파일을 복사하는 방식이라서다).
 
 ```bash
-ros2 launch lidar_camera_fusion_pkg fusion_bringup.launch.py \
+ros2 launch sensor_fusion_bringup full_bringup.launch.py \
   cam_num:=1 \
   serial_port:=/dev/ttyUSB0
 ```
@@ -87,31 +91,59 @@ source install/setup.bash
 
 ## 3. 전체 파이프라인 실행
 
-라이다 + 카메라 + YOLO + 퓨전(거리 측정) 노드를 한 번에 띄운다.
+라이다 + 카메라 + YOLO + 퓨전(거리 측정) + L-shape fitting까지 한 번에 띄운다 (권장 진입점).
+값들은 전부 [`config/params.yaml`](src/sensor_fusion_ws/sensor_fusion_bringup/config/params.yaml)
+하나로 관리되고, 필요하면 launch 인자로 그때그때 override할 수 있다.
+
+```bash
+ros2 launch sensor_fusion_bringup full_bringup.launch.py
+```
+
+라이다·카메라·YOLO·퓨전만 필요하면 (L-shape fitting/rviz 없이) 아래처럼 한 단계 아래 launch 파일을
+직접 실행해도 된다. 단 이 경우 기본값은 `config/params.yaml`이 아니라 그 파일 자체에 하드코딩된 값이다.
 
 ```bash
 ros2 launch lidar_camera_fusion_pkg fusion_bringup.launch.py
 ```
 
-- 정상 동작하면 `"Sensor Fusion"`이라는 이름의 OpenCV 창이 떠서, 카메라 화면에 YOLO bbox와
-  `"클래스명 거리m"` 텍스트가 겹쳐서 표시된다.
-- 화면을 마우스로 클릭하면 그 지점 방향의 라이다 거리도 표시된다 (물체 검출과 무관하게 확인용).
+### 화면 (Fusion Visualizer)
+
+- 정상 동작하면 `Fusion Visualizer`라는 이름의 OpenCV 창 1개가 뜬다. 창을 한 번 클릭해서
+  포커스를 준 뒤 키보드로 화면 모드를 전환할 수 있다.
+
+| 키 | 동작 |
+|---|---|
+| `1` | 주화면: 기본 카메라 이미지 (오버레이 없음) |
+| `2` | 주화면: 라이다 포인트만 표시 |
+| `3` | 주화면: YOLO 바운딩박스 + 거리 표시 (기본 시작 모드) |
+| `4` | 주화면: 버드아이뷰 (추후 구현 예정, 지금은 자리표시만) |
+| `q`/`w`/`e`/`r` | 보조화면을 각각 raw/lidar/boxes/bev로 선택 |
+| `v` | 분할보기 토글 — 켜면 주화면+보조화면을 가로로 나란히 표시 |
+
+- YOLO는 cone/drum 탐지 모델(`best_cone.pt`)과 차량 후면 탐지 모델(`car_back.pt`) 두 개를 동시에
+  돌려서 결과를 하나로 합쳐 발행한다 (`camera_perception_pkg/models/`, `yolov8_node`의 `model` 파라미터에
+  콤마로 구분해서 넘기면 여러 모델을 함께 로딩함).
 
 ### launch 인자 (필요할 때만 덮어쓰기)
 
+`full_bringup.launch.py`의 인자는 `fusion_bringup.launch.py`의 모든 인자에 `fov_deg`, `launch_rviz`가
+추가된 것과 같다 (자세한 표는 [`sensor_fusion_bringup` README](src/sensor_fusion_ws/sensor_fusion_bringup/README.md) 참고).
+자주 바꾸는 것 위주로 추리면:
+
 | 인자 | 기본값 | 설명 |
 |---|---|---|
-| `cam_num` | `0` | 카메라 장치 번호, 1번에서 확인한 값 |
+| `cam_num` | `config/params.yaml` 참고 | 카메라 장치 번호, 1번에서 확인한 값 |
 | `serial_port` | `/dev/ttyUSB0` | 라이다가 다른 포트로 잡히면 변경 |
 | `serial_baudrate` | `460800` | RPLIDAR C1 기준값 |
 | `frame_id` | `laser` | 라이다 스캔 좌표계 이름 |
 | `device` | `cpu` | YOLO 추론 디바이스 (`cpu` / `cuda:0`) |
-| `camera_fov` | `59.5399` | 카메라 수평 화각(도), 캘리브레이션 fx=559.431712 기준 산출값 |
-| `lidar_front_offset_deg` | `180.0` | 라이다 0도 방향과 카메라 정면 방향의 차이(도) |
+| `fx`, `cx` | `565.529459`, `337.983746` | 카메라 초점거리/광학중심(px), 캘리브레이션 결과값 |
+| `lidar_front_offset_deg` | `-180.0` | 라이다 0도 방향과 카메라 정면 방향의 차이(도) |
+| `display_mode` | `boxes` | Fusion Visualizer 시작 화면 모드 (`raw`/`lidar`/`boxes`/`bev`, 실행 중엔 키로 전환) |
 
 예:
 ```bash
-ros2 launch lidar_camera_fusion_pkg fusion_bringup.launch.py serial_port:=/dev/ttyUSB1 device:=cuda:0
+ros2 launch sensor_fusion_bringup full_bringup.launch.py serial_port:=/dev/ttyUSB1 device:=cuda:0
 ```
 
 ## 4. 정상 동작 확인 (다른 터미널에서)
@@ -144,14 +176,20 @@ ros2 run rplidar_ros rplidar_node --ros-args -p serial_port:=/dev/ttyUSB0 -p ser
 ros2 run camera_perception_pkg image_publisher_node
 
 # YOLO만 (카메라가 먼저 떠 있어야 함, 모델 경로는 설치 경로 기준)
+# model 파라미터에 콤마로 여러 개를 넘기면 각 모델을 모두 돌려서 결과를 합쳐 발행한다
+MODELS_DIR=$(ros2 pkg prefix camera_perception_pkg)/share/camera_perception_pkg/models
 ros2 run camera_perception_pkg yolov8_node --ros-args \
-  -p model:=$(ros2 pkg prefix camera_perception_pkg)/share/camera_perception_pkg/models/best.pt \
+  -p model:="$MODELS_DIR/best_cone.pt,$MODELS_DIR/car_back.pt" \
   -p device:=cpu
 
-# 퓨전만 (카메라·라이다·YOLO가 먼저 떠 있어야 함)
-ros2 run lidar_camera_fusion_pkg sensor_fusion_node --ros-args \
-  -p camera_fov:=59.5399 -p lidar_front_offset_deg:=180.0
+# 퓨전만 (카메라·라이다·YOLO가 먼저 떠 있어야 함) — 실제 launch 파일이 쓰는 노드
+ros2 run lidar_camera_fusion_pkg image_fusion_node --ros-args \
+  -p fx:=565.529459 -p cx:=337.983746 -p front_angle_deg:=-180.0
 ```
+
+> `lidar_camera_fusion_pkg`에는 `sensor_fusion_node`(동축 마운트 가정, 픽셀 각도 기반)라는 더 단순한
+> 대안 노드도 있지만, 현재 launch 파일들은 `image_fusion_node`(3D 투영 기반)를 사용한다.
+> 자세한 차이는 [`lidar_camera_fusion_pkg` README](src/sensor_fusion_ws/lidar_camera_fusion_pkg/README.md) 참고.
 
 ### 자주 나는 에러
 
@@ -164,7 +202,9 @@ ros2 run lidar_camera_fusion_pkg sensor_fusion_node --ros-args \
 
 ## 6. 캘리브레이션이 바뀌면
 
-- 카메라를 바꾸거나 재캘리브레이션하면 `camera_fov`를 다시 계산해서 launch 인자로 넘길 것:
-  `camera_fov = 2 * atan(width / (2 * fx))` (도 단위 변환 필요)
+- 카메라를 바꾸거나 재캘리브레이션하면 `fx`, `cx`(필요하면 `image_fusion_node`의 `fy`, `cy`도)를
+  새 값으로 갱신할 것. `config/params.yaml`을 고치고 `colcon build --packages-select sensor_fusion_bringup`.
 - 라이다/카메라 장착 방향을 바꾸면 `lidar_front_offset_deg` 재확인 (자세한 내용은
   [`lidar_camera_fusion_pkg` README](src/sensor_fusion_ws/lidar_camera_fusion_pkg/README.md) 참고)
+- 새 YOLO 모델(`.pt`)을 받으면 `camera_perception_pkg/models/`에 넣고, `yolov8_node`의 `model`
+  파라미터(콤마로 여러 개 지정 가능)를 그 파일명으로 맞춘 뒤 `camera_perception_pkg`를 재빌드할 것.

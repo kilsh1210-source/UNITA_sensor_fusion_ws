@@ -53,6 +53,8 @@ class Yolov8Node(LifecycleNode):
         
         #---------------Variable Setting---------------
         # 딥러닝 모델 pt 파일명 작성 (launch에서 절대경로로 덮어쓰는 것을 권장)
+        # 콤마(,)로 여러 개 지정하면 각 모델을 모두 돌려서 결과를 하나로 합쳐 발행함
+        # (예: "best_cone.pt,car_back.pt")
         #self.declare_parameter("model", "yolov8m.pt")
         self.declare_parameter("model", "best.pt")
         
@@ -114,15 +116,22 @@ class Yolov8Node(LifecycleNode):
     def on_activate(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f'Activating {self.get_name()}')
 
-        try:
-            self.yolo = YOLO(self.model)  # 모델 로딩
-            self.yolo.fuse()
-        except FileNotFoundError:
-            self.get_logger().error(f"Error: Model file '{self.model}' not found!")
-            return TransitionCallbackReturn.FAILURE
-        except Exception as e:
-            self.get_logger().error(f"Error while loading model '{self.model}': {str(e)}")
-            return TransitionCallbackReturn.FAILURE
+        model_paths = [p.strip() for p in self.model.split(',') if p.strip()]
+
+        self.yolo_list: List[YOLO] = []
+        for path in model_paths:
+            try:
+                yolo = YOLO(path)  # 모델 로딩
+                yolo.fuse()
+                self.yolo_list.append(yolo)
+            except FileNotFoundError:
+                self.get_logger().error(f"Error: Model file '{path}' not found!")
+                return TransitionCallbackReturn.FAILURE
+            except Exception as e:
+                self.get_logger().error(f"Error while loading model '{path}': {str(e)}")
+                return TransitionCallbackReturn.FAILURE
+
+        self.get_logger().info(f"Loaded {len(self.yolo_list)} model(s): {model_paths}")
 
         # subs
         self._sub = self.create_subscription(
@@ -140,7 +149,7 @@ class Yolov8Node(LifecycleNode):
     def on_deactivate(self, state: LifecycleState) -> TransitionCallbackReturn:
         self.get_logger().info(f'Deactivating {self.get_name()}')
 
-        del self.yolo
+        del self.yolo_list
         if 'cuda' in self.device:
             self.get_logger().info("Clearing CUDA cache")
             cuda.empty_cache()
@@ -161,7 +170,7 @@ class Yolov8Node(LifecycleNode):
 
         return TransitionCallbackReturn.SUCCESS
 
-    def parse_hypothesis(self, results: Results) -> List[Dict]:
+    def parse_hypothesis(self, results: Results, yolo: YOLO) -> List[Dict]:
 
         hypothesis_list = []
 
@@ -169,7 +178,7 @@ class Yolov8Node(LifecycleNode):
         for box_data in results.boxes:
             hypothesis = {
                 "class_id": int(box_data.cls),
-                "class_name": self.yolo.names[int(box_data.cls)],
+                "class_name": yolo.names[int(box_data.cls)],
                 "score": float(box_data.conf)
             }
             hypothesis_list.append(hypothesis)
@@ -254,55 +263,58 @@ class Yolov8Node(LifecycleNode):
 
         if self.enable:
 
-            # convert image + predict
+            # convert image once, run every loaded model against it
             cv_image = self.cv_bridge.imgmsg_to_cv2(msg)
-            results = self.yolo.predict(
-                source=cv_image,
-                verbose=False,
-                stream=False,
-                conf=self.threshold,
-                iou=self.iou,
-                device=self.device
-            )
-            results: Results = results[0].cpu()
 
-            if results.boxes:
-                hypothesis = self.parse_hypothesis(results)
-                boxes = self.parse_boxes(results)
-
-            if results.masks:
-                masks = self.parse_masks(results)
-
-            if results.keypoints:
-                keypoints = self.parse_keypoints(results)
-
-            # create detection msgs
             detections_msg = DetectionArray()
+            detections_msg.header = msg.header
 
-            for i in range(len(results)):
+            for yolo in self.yolo_list:
 
-                aux_msg = Detection()
+                results = yolo.predict(
+                    source=cv_image,
+                    verbose=False,
+                    stream=False,
+                    conf=self.threshold,
+                    iou=self.iou,
+                    device=self.device
+                )
+                results: Results = results[0].cpu()
 
                 if results.boxes:
-                    aux_msg.class_id = hypothesis[i]["class_id"]
-                    aux_msg.class_name = hypothesis[i]["class_name"]
-                    aux_msg.score = hypothesis[i]["score"]
-
-                    aux_msg.bbox = boxes[i]
+                    hypothesis = self.parse_hypothesis(results, yolo)
+                    boxes = self.parse_boxes(results)
 
                 if results.masks:
-                    aux_msg.mask = masks[i]
+                    masks = self.parse_masks(results)
 
                 if results.keypoints:
-                    aux_msg.keypoints = keypoints[i]
+                    keypoints = self.parse_keypoints(results)
 
-                detections_msg.detections.append(aux_msg)
+                for i in range(len(results)):
 
-            # publish detections
-            detections_msg.header = msg.header
+                    aux_msg = Detection()
+
+                    if results.boxes:
+                        aux_msg.class_id = hypothesis[i]["class_id"]
+                        aux_msg.class_name = hypothesis[i]["class_name"]
+                        aux_msg.score = hypothesis[i]["score"]
+
+                        aux_msg.bbox = boxes[i]
+
+                    if results.masks:
+                        aux_msg.mask = masks[i]
+
+                    if results.keypoints:
+                        aux_msg.keypoints = keypoints[i]
+
+                    detections_msg.detections.append(aux_msg)
+
+                del results
+
+            # publish merged detections from all models
             self._pub.publish(detections_msg)
 
-            del results
             del cv_image
 
 

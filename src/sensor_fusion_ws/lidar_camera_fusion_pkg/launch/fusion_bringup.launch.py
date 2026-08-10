@@ -16,17 +16,21 @@ def generate_launch_description():
     cx = LaunchConfiguration('cx', default='337.983746')
     lidar_front_offset_deg = LaunchConfiguration('lidar_front_offset_deg', default='-180.0')
     cam_num = LaunchConfiguration('cam_num', default='0')
-    show_split_view = LaunchConfiguration('show_split_view', default='true')
+    display_mode = LaunchConfiguration('display_mode', default='boxes')
     distance_tolerance = LaunchConfiguration('distance_tolerance', default='0.6')
     draw_all_points = LaunchConfiguration('draw_all_points', default='true')
     use_urdf_extrinsic = LaunchConfiguration('use_urdf_extrinsic', default='false')
     lidar_frame_id = LaunchConfiguration('lidar_frame_id', default='laser')
-    camera_frame_id = LaunchConfiguration('camera_frame_id', default='camera_link')
+    camera_frame_id = LaunchConfiguration('camera_frame_id', default='camera_link_tilted')
 
-    model_path = os.path.join(
-        get_package_share_directory('camera_perception_pkg'),
-        'models', 'best.pt'
+    # cone/drum 탐지 모델 + 차량 후면 탐지 모델을 함께 로딩 (콤마로 구분, yolov8_node가 각각 추론 후 결과를 합쳐서 발행)
+    camera_models_dir = os.path.join(
+        get_package_share_directory('camera_perception_pkg'), 'models'
     )
+    model_path = ','.join([
+        os.path.join(camera_models_dir, 'best_cone.pt'),
+        os.path.join(camera_models_dir, 'car_back.pt'),
+    ])
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -55,8 +59,9 @@ def generate_launch_description():
             'cam_num', default_value=cam_num,
             description='카메라 장치 번호 (ls /dev/video* 로 확인)'),
         DeclareLaunchArgument(
-            'show_split_view', default_value=show_split_view,
-            description='전체 클라우드와 bbox-겹침 뷰를 함께 보여줄지 여부'),
+            'display_mode', default_value=display_mode,
+            description='Fusion Visualizer 시작 화면 모드: raw / lidar / boxes / bev '
+                        '(창에서 숫자키 1~4로 실행 중 전환 가능)'),
         DeclareLaunchArgument(
             'draw_all_points', default_value=draw_all_points,
             description='카메라 위에 라이다 포인트를 전부 그릴지 여부'),
@@ -125,7 +130,7 @@ def generate_launch_description():
                 'fx': fx,
                 'cx': cx,
                 'front_angle_deg': lidar_front_offset_deg,
-                'show_split_view': show_split_view,
+                'display_mode': display_mode,
                 'draw_all_points': draw_all_points,
                 'distance_tolerance': distance_tolerance,
                 'use_urdf_extrinsic': use_urdf_extrinsic,
