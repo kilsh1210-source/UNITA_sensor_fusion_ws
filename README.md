@@ -89,6 +89,24 @@ source install/setup.bash
 
 매번 새 터미널을 열 때마다 `/opt/ros/humble/setup.bash`와 `install/setup.bash` 두 개를 순서대로 source 해야 한다.
 
+### 2-1. CUDA 확인 (GPU 사용 시)
+
+`yolov8_node`/`bird_eye_node`의 추론 디바이스 기본값은 `cuda:0`다 (Jetson Orin Nano 등 GPU 대상).
+실행 전에 CUDA를 실제로 쓸 수 있는지 먼저 확인한다.
+
+```bash
+python3 -c "import torch; print('cuda available:', torch.cuda.is_available())"
+```
+
+`True`가 아니면:
+
+- Jetson은 일반 `pip install torch`(x86/CUDA 데스크톱용)로는 GPU를 못 잡는다. JetPack 버전에 맞는
+  NVIDIA 전용 torch/torchvision wheel(또는 그걸 반영한 `ultralytics`)을 설치해야 한다.
+- GPU가 아예 없는 환경(개발 PC 등)에서는 `device:=cpu`를 launch 인자로 넘겨서 CPU로 돌리면 된다:
+  ```bash
+  ros2 launch sensor_fusion_bringup full_bringup.launch.py device:=cpu
+  ```
+
 ## 3. 전체 파이프라인 실행
 
 라이다 + 카메라 + YOLO + 퓨전(거리 측정) + L-shape fitting까지 한 번에 띄운다 (권장 진입점).
@@ -116,8 +134,9 @@ ros2 launch lidar_camera_fusion_pkg fusion_bringup.launch.py
 | `1` | 주화면: 기본 카메라 이미지 (오버레이 없음) |
 | `2` | 주화면: 라이다 포인트만 표시 |
 | `3` | 주화면: YOLO 바운딩박스 + 거리 표시 (기본 시작 모드) |
-| `4` | 주화면: 버드아이뷰 (추후 구현 예정, 지금은 자리표시만) |
-| `q`/`w`/`e`/`r` | 보조화면을 각각 raw/lidar/boxes/bev로 선택 |
+| `4` | 주화면: 버드아이뷰 (`bird_eye_node`의 차선 검출 결과) |
+| `5` | 주화면: 버드아이뷰 ROI 원본 (버드아이뷰 변환에 쓰는 사다리꼴을 원본 위에 표시) |
+| `q`/`w`/`e`/`r`/`t` | 보조화면을 각각 raw/lidar/boxes/bev/bev_roi로 선택 |
 | `v` | 분할보기 토글 — 켜면 주화면+보조화면을 가로로 나란히 표시 |
 
 - YOLO는 cone/drum 탐지 모델(`best_cone.pt`)과 차량 후면 탐지 모델(`car_back.pt`) 두 개를 동시에
@@ -136,10 +155,10 @@ ros2 launch lidar_camera_fusion_pkg fusion_bringup.launch.py
 | `serial_port` | `/dev/ttyUSB0` | 라이다가 다른 포트로 잡히면 변경 |
 | `serial_baudrate` | `460800` | RPLIDAR C1 기준값 |
 | `frame_id` | `laser` | 라이다 스캔 좌표계 이름 |
-| `device` | `cpu` | YOLO 추론 디바이스 (`cpu` / `cuda:0`) |
+| `device` | `cuda:0` | YOLO/버드아이뷰 추론 디바이스 (`cuda:0` / `cpu`, GPU 없으면 `cpu`로 override) |
 | `fx`, `cx` | `565.529459`, `337.983746` | 카메라 초점거리/광학중심(px), 캘리브레이션 결과값 |
 | `lidar_front_offset_deg` | `-180.0` | 라이다 0도 방향과 카메라 정면 방향의 차이(도) |
-| `display_mode` | `boxes` | Fusion Visualizer 시작 화면 모드 (`raw`/`lidar`/`boxes`/`bev`, 실행 중엔 키로 전환) |
+| `display_mode` | `boxes` | Fusion Visualizer 시작 화면 모드 (`raw`/`lidar`/`boxes`/`bev`/`bev_roi`, 실행 중엔 키로 전환) |
 
 예:
 ```bash
@@ -180,7 +199,7 @@ ros2 run camera_perception_pkg image_publisher_node
 MODELS_DIR=$(ros2 pkg prefix camera_perception_pkg)/share/camera_perception_pkg/models
 ros2 run camera_perception_pkg yolov8_node --ros-args \
   -p model:="$MODELS_DIR/best_cone.pt,$MODELS_DIR/car_back.pt" \
-  -p device:=cpu
+  -p device:=cuda:0
 
 # 퓨전만 (카메라·라이다·YOLO가 먼저 떠 있어야 함) — 실제 launch 파일이 쓰는 노드
 ros2 run lidar_camera_fusion_pkg image_fusion_node --ros-args \
