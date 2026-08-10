@@ -8,7 +8,7 @@ from launch_ros.actions import Node
 # 카메라가 지면 쪽으로 내려다보는 각도(도, 실측값). URDF의 camera_joint는 rpy가 전부 0이라
 # 실제 다운틸트가 반영돼 있지 않음. URDF 파일 자체는 건드리지 않고, camera_link 아래에
 # 이 각도만큼 기운 자식 프레임(camera_link_tilted)을 별도 static TF로 추가해서 보정한다.
-CAMERA_PITCH_DEG = 10.0
+CAMERA_PITCH_DEG = 14.0
 
 
 def generate_launch_description():
@@ -43,7 +43,24 @@ def generate_launch_description():
         ],
     )
 
+    # camera_link_tilted(로봇 표준 좌표계: X정면/Y왼쪽/Z위)를 카메라 광학 좌표계
+    # (X오른쪽/Y아래/Z정면=깊이)로 변환. URDF의 camera_optical_joint와 동일한 회전이지만
+    # camera_link_tilted의 자식으로 붙여서, 핀홀 투영(image_fusion_node)이 틸트 보정과
+    # 광학 축 변환을 모두 반영한 프레임을 쓸 수 있게 한다.
+    camera_optical_tilted_tf_node = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='camera_optical_tilted_static_tf',
+        arguments=[
+            '--x', '0', '--y', '0', '--z', '0',
+            '--roll', '-1.57079632679', '--pitch', '0', '--yaw', '-1.57079632679',
+            '--frame-id', 'camera_link_tilted',
+            '--child-frame-id', 'camera_optical_frame_tilted',
+        ],
+    )
+
     return LaunchDescription([
         robot_state_publisher_node,
         camera_tilt_tf_node,
+        camera_optical_tilted_tf_node,
     ])

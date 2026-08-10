@@ -21,7 +21,7 @@ def generate_launch_description():
     draw_all_points = LaunchConfiguration('draw_all_points', default='true')
     use_urdf_extrinsic = LaunchConfiguration('use_urdf_extrinsic', default='false')
     lidar_frame_id = LaunchConfiguration('lidar_frame_id', default='laser')
-    camera_frame_id = LaunchConfiguration('camera_frame_id', default='camera_link_tilted')
+    camera_frame_id = LaunchConfiguration('camera_frame_id', default='camera_optical_frame_tilted')
 
     # cone/drum 탐지 모델 + 차량 후면 탐지 모델을 함께 로딩 (콤마로 구분, yolov8_node가 각각 추론 후 결과를 합쳐서 발행)
     camera_models_dir = os.path.join(

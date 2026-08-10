@@ -103,7 +103,9 @@ class FusionVisualizerNode(Node):
 
         # 최신 데이터 유효 시간(초): 너무 오래된 scan/det는 무시
         self.declare_parameter('max_age_scan', 0.5)
-        self.declare_parameter('max_age_det', 0.5)
+        # CPU에서 2개 모델을 순차 추론하다 보니 프레임당 지연이 들쭉날쭉할 수 있음.
+        # 너무 짧으면 추론이 살짝 느려질 때마다 박스가 깜빡이므로 여유 있게 잡음.
+        self.declare_parameter('max_age_det', 1.5)
 
         # Load params
         self.image_topic = self.get_parameter('image_topic').value
@@ -279,6 +281,11 @@ class FusionVisualizerNode(Node):
         self.last_scan_time = self.get_clock().now()
 
     def det_cb(self, msg: DetectionArray):
+        # yolov8_node는 탐지가 하나도 없는 프레임에도 빈 DetectionArray를 계속 발행한다.
+        # 여기서 그걸 그대로 반영하면 박스가 매 프레임 깜빡이므로, 빈 메시지는 무시하고
+        # max_age_det 타임아웃이 지났을 때만 박스가 사라지게 한다.
+        if len(msg.detections) == 0:
+            return
         self.last_det = msg
         self.last_det_time = self.get_clock().now()
 

@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pkill -f \"launch_params_\")",
+      "Bash(pkill -f \"rplidar_node|image_publisher_node|yolov8_node|image_fusion_node|l_shape_node\")",
+      "Bash(pkill -f \"rviz2\")",
+      "Bash(pkill -f \"static_transform_publisher|robot_state_publisher\")",
+      "Read(//dev/**)",
+      "Bash(v4l2-ctl --list-devices)",
+      "Bash(fuser /dev/video0)"
+    ]
+  }
+}
