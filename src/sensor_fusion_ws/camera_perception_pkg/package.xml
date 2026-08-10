@@ -12,6 +12,7 @@
   <depend>std_srvs</depend>
   <depend>cv_bridge</depend>
   <depend>interfaces_pkg</depend>
+  <depend>ament_index_python</depend>
 
   <exec_depend>python3-opencv</exec_depend>
 

@@ -120,6 +120,18 @@ def generate_launch_description():
             }],
         ),
 
+        # Bird's-eye lane view (Fusion Visualizer의 4번 화면에 표시됨)
+        Node(
+            package='camera_perception_pkg',
+            executable='bird_eye_node',
+            name='bird_eye_node',
+            output='screen',
+            parameters=[{
+                'device': device,
+                'show_preview': False,
+            }],
+        ),
+
         # LiDAR-Camera fusion (distance overlay)
         Node(
             package='lidar_camera_fusion_pkg',

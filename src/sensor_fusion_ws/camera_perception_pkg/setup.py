@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'yolov8_node = camera_perception_pkg.yolov8_node:main',
             'image_publisher_node = camera_perception_pkg.image_publisher_node:main',
+            'bird_eye_node = camera_perception_pkg.bird_eye_node:main',
         ],
     },
 )

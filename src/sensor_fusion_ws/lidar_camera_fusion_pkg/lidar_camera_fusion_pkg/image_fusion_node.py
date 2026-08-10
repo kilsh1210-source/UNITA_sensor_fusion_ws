@@ -38,7 +38,7 @@ MODE_LABELS = {
     'raw': 'Raw Camera',
     'lidar': 'LiDAR Points',
     'boxes': 'Bounding Boxes',
-    'bev': "Bird's Eye View (TODO)",
+    'bev': "Bird's Eye View",
 }
 
 
@@ -60,6 +60,7 @@ class FusionVisualizerNode(Node):
         self.declare_parameter('image_topic', '/image_raw')
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('det_topic', '/detections')
+        self.declare_parameter('bird_eye_topic', '/bird_eye/image')
 
         self.declare_parameter('publish_annotated', False)
         self.declare_parameter('annotated_topic', '/fusion/annotated_image')
@@ -106,11 +107,13 @@ class FusionVisualizerNode(Node):
         # CPU에서 2개 모델을 순차 추론하다 보니 프레임당 지연이 들쭉날쭉할 수 있음.
         # 너무 짧으면 추론이 살짝 느려질 때마다 박스가 깜빡이므로 여유 있게 잡음.
         self.declare_parameter('max_age_det', 1.5)
+        self.declare_parameter('max_age_bev', 1.5)
 
         # Load params
         self.image_topic = self.get_parameter('image_topic').value
         self.scan_topic = self.get_parameter('scan_topic').value
         self.det_topic = self.get_parameter('det_topic').value
+        self.bird_eye_topic = self.get_parameter('bird_eye_topic').value
 
         self.publish_annotated = bool(self.get_parameter('publish_annotated').value)
         self.annotated_topic = self.get_parameter('annotated_topic').value
@@ -159,6 +162,7 @@ class FusionVisualizerNode(Node):
 
         self.max_age_scan = float(self.get_parameter('max_age_scan').value)
         self.max_age_det = float(self.get_parameter('max_age_det').value)
+        self.max_age_bev = float(self.get_parameter('max_age_bev').value)
 
         self.bridge = CvBridge()
 
@@ -169,12 +173,16 @@ class FusionVisualizerNode(Node):
         self.last_det: Optional[DetectionArray] = None
         self.last_det_time = None
 
+        self.last_bev: Optional[np.ndarray] = None
+        self.last_bev_time = None
+
         self.last_img_time = None
 
         # Subscribers (QoS: sensor_data로 고정)
         self.create_subscription(Image, self.image_topic, self.image_cb, qos_profile_sensor_data)
         self.create_subscription(LaserScan, self.scan_topic, self.scan_cb, qos_profile_sensor_data)
         self.create_subscription(DetectionArray, self.det_topic, self.det_cb, 10)  # det는 reliable여도 수신 가능
+        self.create_subscription(Image, self.bird_eye_topic, self.bev_cb, qos_profile_sensor_data)
 
         # Publisher
         if self.publish_annotated:
@@ -196,6 +204,7 @@ class FusionVisualizerNode(Node):
             f"  image_topic={self.image_topic}\n"
             f"  scan_topic={self.scan_topic}\n"
             f"  det_topic={self.det_topic}\n"
+            f"  bird_eye_topic={self.bird_eye_topic}\n"
             f"  publish_annotated={self.publish_annotated} ({self.annotated_topic})\n"
         )
 
@@ -289,6 +298,14 @@ class FusionVisualizerNode(Node):
         self.last_det = msg
         self.last_det_time = self.get_clock().now()
 
+    def bev_cb(self, img_msg: Image):
+        try:
+            self.last_bev = self.bridge.imgmsg_to_cv2(img_msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f"bev imgmsg_to_cv2 failed: {e}")
+            return
+        self.last_bev_time = self.get_clock().now()
+
     def image_cb(self, img_msg: Image):
         self.last_img_time = self.get_clock().now()
 
@@ -308,6 +325,7 @@ class FusionVisualizerNode(Node):
 
         scan_ok = False
         det_ok = False
+        bev_ok = False
 
         if self.last_scan is not None and self.last_scan_time is not None:
             scan_age = (now - self.last_scan_time).nanoseconds / 1e9
@@ -316,6 +334,10 @@ class FusionVisualizerNode(Node):
         if self.last_det is not None and self.last_det_time is not None:
             det_age = (now - self.last_det_time).nanoseconds / 1e9
             det_ok = (det_age <= self.max_age_det)
+
+        if self.last_bev is not None and self.last_bev_time is not None:
+            bev_age = (now - self.last_bev_time).nanoseconds / 1e9
+            bev_ok = (bev_age <= self.max_age_bev)
 
         # 3) scan -> projected points (lidar/boxes 모드에서 사용)
         needed_modes = {self.mode} | ({self.secondary} if self.split_view else set())
@@ -328,11 +350,11 @@ class FusionVisualizerNode(Node):
             u_pix, v_pix, ranges = self.project_scan_to_image(self.last_scan, w, h)
 
         # 4) 화면 모드별 프레임 생성 (분할뷰면 주+보조 2장, 아니면 주화면 1장)
-        display = self._render_mode(self.mode, img, w, h, scan_ok, det_ok, u_pix, v_pix, ranges)
+        display = self._render_mode(self.mode, img, w, h, scan_ok, det_ok, bev_ok, u_pix, v_pix, ranges)
 
         if self.split_view:
             secondary_frame = self._render_mode(
-                self.secondary, img, w, h, scan_ok, det_ok, u_pix, v_pix, ranges)
+                self.secondary, img, w, h, scan_ok, det_ok, bev_ok, u_pix, v_pix, ranges)
             display = cv2.hconcat([display, secondary_frame])
 
         # 5) show / publish
@@ -356,7 +378,7 @@ class FusionVisualizerNode(Node):
             out_msg.header.frame_id = img_msg.header.frame_id
             self.pub_img.publish(out_msg)
 
-    def _render_mode(self, mode, img, w, h, scan_ok, det_ok, u_pix, v_pix, ranges) -> np.ndarray:
+    def _render_mode(self, mode, img, w, h, scan_ok, det_ok, bev_ok, u_pix, v_pix, ranges) -> np.ndarray:
         if mode == 'raw':
             frame = img.copy()
 
@@ -403,8 +425,11 @@ class FusionVisualizerNode(Node):
 
                     self._draw_box_with_label(frame, x1c, y1c, x2c, y2c, color, text, best_uv)
 
-        else:  # bev - 추후 구현 전까지는 자리만
-            frame = self._bev_placeholder(img.shape)
+        else:  # bev - bird_eye_node(camera_perception_pkg)의 출력을 그대로 표시
+            if bev_ok and self.last_bev is not None:
+                frame = cv2.resize(self.last_bev, (w, h), interpolation=cv2.INTER_LINEAR)
+            else:
+                frame = self._bev_placeholder(img.shape)
 
         cv2.putText(frame, MODE_LABELS[mode], (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
@@ -414,7 +439,7 @@ class FusionVisualizerNode(Node):
     def _bev_placeholder(shape) -> np.ndarray:
         h, w = shape[:2]
         frame = np.zeros((h, w, 3), dtype=np.uint8)
-        cv2.putText(frame, "Bird's Eye View - TODO", (30, h // 2),
+        cv2.putText(frame, "Bird's Eye View - No Signal", (30, h // 2),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
         return frame
 
