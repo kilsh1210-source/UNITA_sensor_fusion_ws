@@ -1,19 +1,23 @@
 # sensor_fusion_bringup
 
-여러 서브시스템(카메라-라이다 퓨전, L-shape fitting, 추후 추가될 bird's eye view 등)을 한 번에 묶어서
+여러 서브시스템(카메라-라이다 퓨전, bird's eye view, L-shape fitting, URDF TF 등)을 한 번에 묶어서
 실행하기 위한 최상위 launch 모음 패키지. 각 서브시스템은 자기 패키지 안에 자체 launch 파일(예:
-`lidar_camera_fusion_pkg`의 `fusion_bringup.launch.py`, `lidar_cluster_pkg`의 `l_shape_bringup.launch.py`)을
-그대로 가지고 있고, 이 패키지는 그것들을 조합만 한다. 새로운 서브시스템이 추가돼도 이 패키지에 새 launch
-파일만 늘리면 된다.
+`lidar_camera_fusion_pkg`의 `fusion_bringup.launch.py`, `lidar_cluster_pkg`의 `l_shape_bringup.launch.py`,
+`unita_minicar_description`의 `description.launch.py`)을 그대로 가지고 있고, 이 패키지는 그것들을
+조합만 한다. 새로운 서브시스템이 추가돼도 이 패키지에 새 launch 파일만 늘리면 된다.
 
 ## launch
 
 ### `full_bringup.launch.py`
 
-`fusion_bringup.launch.py`(라이다 드라이버+카메라+YOLO+퓨전)를 통째로 include하고, 그 위에
-`lidar_cluster_pkg`의 `l_shape_node`만 추가로 띄운다. `rplidar_node`는 fusion 쪽에서 한 번만 실행되고
-`l_shape_node`는 같은 `/scan`을 구독만 하므로 시리얼 포트 충돌이 없다 (`l_shape_bringup.launch.py`처럼
-드라이버를 따로 또 띄우면 포트 충돌로 `/scan`을 못 받으니 주의).
+`unita_minicar_description`의 `description.launch.py`(URDF 기반 `base_link`→`laser`/`camera_link` 등
+고정 TF)와 `fusion_bringup.launch.py`(라이다 드라이버+카메라+YOLO(멀티모델)+`bird_eye_node`+퓨전)를
+통째로 include하고, 그 위에 `lidar_cluster_pkg`의 `l_shape_node`만 추가로 띄운다. `rplidar_node`는 fusion
+쪽에서 한 번만 실행되고 `l_shape_node`는 같은 `/scan`을 구독만 하므로 시리얼 포트 충돌이 없다
+(`l_shape_bringup.launch.py`처럼 드라이버를 따로 또 띄우면 포트 충돌로 `/scan`을 못 받으니 주의).
+
+URDF TF를 먼저 띄우는 이유는 `image_fusion_node`의 `use_urdf_extrinsic`(이 launch에서는 기본 `true`)이
+매 프레임 `lidar_frame_id`→`camera_frame_id` TF를 조회해서 라이다→카메라 외부파라미터로 쓰기 때문이다.
 
 ```bash
 ros2 launch sensor_fusion_bringup full_bringup.launch.py
@@ -34,6 +38,6 @@ override할 수 있다(`ros2 launch sensor_fusion_bringup full_bringup.launch.py
 `l_shape_node`는 이 launch 파일이 직접 실행하는 노드라 `config/params.yaml`을 통째로 로드한다 —
 `cluster_tolerance`, `min_cluster_size`, `rect_line_width` 등 launch 인자로는 노출되지 않는 세부
 파라미터까지 전부 여기서 관리된다. 반면 `rplidar_node`/`image_publisher_node`/`yolov8_node`/
-`image_fusion_node`는 `fusion_bringup.launch.py`가 별도 패키지에서 소유하고 있어서, 이 YAML의 값은
-그 launch 파일로 전달되는 인자의 "기본값"으로만 쓰인다 (전체 파라미터를 다 노출하려면
+`bird_eye_node`/`image_fusion_node`는 `fusion_bringup.launch.py`가 별도 패키지에서 소유하고 있어서,
+이 YAML의 값은 그 launch 파일로 전달되는 인자의 "기본값"으로만 쓰인다 (전체 파라미터를 다 노출하려면
 `fusion_bringup.launch.py` 자체를 손봐야 함).
