@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'image_fusion_node = lidar_camera_fusion_pkg.image_fusion_node:main',
             'sensor_fusion_node = lidar_camera_fusion_pkg.sensor_fusion_node:main',
+            'calibration_node = lidar_camera_fusion_pkg.calibration_node:main',
         ],
     },
 )

@@ -10,23 +10,64 @@
 
 rplidar_node:
   ros__parameters:
-    serial_port: /dev/ttyUSB0
+    # /dev/ttyUSB0 같은 번호는 재연결/재부팅마다 바뀐다(실제로 ttyUSB0 -> ttyUSB1로 바뀌면서
+    # rplidar_node가 사라진 포트를 붙잡은 채 좀비가 된 적 있음: 프로세스는 살아있는데 /scan은 안 나옴).
+    # 아래 by-id 경로는 라이다 USB-시리얼 칩(CP2102N)의 시리얼 번호 기반이라
+    # 어느 포트에 꽂든, 재부팅해도 그대로다.
+    # 목록 확인: ls -l /dev/serial/by-id/
+    serial_port: /dev/serial/by-id/usb-Silicon_Labs_CP2102N_USB_to_UART_Bridge_Controller_7a472fe3536eef11b42ae5c2c169b110-if00-port0
     serial_baudrate: 460800
     frame_id: laser
 
 image_publisher_node:
   ros__parameters:
     cam_num: 0
+    # C920 두 대가 꽂혀 있고 모델명이 같아서 by-id로는 구분이 안 된다
+    # (두 번째 카메라는 by-id 링크가 아예 안 생김 - 이름 충돌).
+    # 그래서 "꽂은 USB 포트" 기준인 by-path로 전방(YOLO용) 카메라를 고정한다.
+    # 번호(cam_num)는 재부팅마다 바뀔 수 있으므로 이 값이 있으면 그쪽이 우선.
+    # 목록 확인: ros2 run camera_perception_pkg list_cameras --probe
+    # 만약 화면에 다른 카메라가 나오면 아래 2.2.4.3 을 2.2.3 으로 바꾸면 된다.
+    camera_device: /dev/v4l/by-path/platform-3610000.usb-usb-0:2.2.4.3:1.0-video-index0
+    # 캘리브레이션(fx/fy/cx/cy)을 뽑은 해상도와 반드시 같아야 함
+    frame_width: 640
+    frame_height: 480
+    # 오토포커스/자동노출 고정.
+    # 켜 두면 가만히 있는 동안 초점이 먼 배경으로 옮겨가서, 가까운 콘은 흐려져 놓치고
+    # 먼 배경에서 오탐이 난다(손으로 렌즈를 가렸다 떼면 재수렴해서 잠깐 잘 잡히는 이유).
+    autofocus: false
+    focus: -1              # 0~255 절대 초점값. -1이면 안 건드림.
+                           # 콘이 잘 보이는 거리에 맞춰 잡을 것 (아래 README의 튜닝 절차 참고)
+    auto_exposure: false
+    exposure: -1           # -1이면 안 건드림. 실내에서 화면이 너무 어두우면 값을 올릴 것
+    auto_white_balance: false
+    white_balance: -1
+    use_mjpg: true
 
 yolov8_node:
   ros__parameters:
     device: cuda:0
+    threshold: 0.5
+    iou: 0.45
+    # --- 오탐 억제 ---
+    # 멀리 있는 배경에서 작은 박스로 튀는 오탐 제거용. 0이면 해당 필터 끔.
+    # 640x480 기준: 24x24 px보다 작은 검출은 주행에 쓸 만큼 가깝지 않다고 보고 버림.
+    min_box_area_px: 576
+    min_box_height_px: 20
+    # bbox 아래변이 화면 위쪽 30% 안에서 끝나면 버림 (지평선 위 = 하늘/먼 배경)
+    min_box_bottom_ratio: 0.30
+    # 클래스별 임계값 override 예시: "cone:0.60,drum:0.55"
+    class_thresholds: ""
+    log_filtered: true
 
 image_fusion_node:
   ros__parameters:
-    # 카메라 내부파라미터(캘리브레이션 값)
+    # 카메라 내부파라미터(캘리브레이션 값). 4개 다 여기서 관리한다
+    # (예전에는 fx/cx만 launch로 넘어가고 fy/cy는 소스 기본값이 조용히 쓰였음)
     fx: 565.529459
+    fy: 566.767111
     cx: 337.983746
+    cy: 290.095566
     # 라이다 정면 방향 보정(도). l_shape_node의 front_angle_deg에도 동일 적용.
     front_angle_deg: -180.0
     display_mode: boxes       # raw / lidar / boxes / bev (창에서 숫자키 1~4로 실행 중 전환 가능)
@@ -34,7 +75,37 @@ image_fusion_node:
     draw_all_points: true
     use_urdf_extrinsic: true
     lidar_frame_id: laser
-    camera_frame_id: camera_optical_frame_tilted  # camera_link_tilted(-10도 다운틸트)를 광학 좌표계(X우/Y하/Z앞)로 변환한 프레임 (unita_minicar_description/launch/description.launch.py)
+    camera_frame_id: camera_optical_frame_tilted  # camera_link_tilted(camera_pitch_deg 다운틸트)를 광학 좌표계(X우/Y하/Z앞)로 변환한 프레임 (unita_minicar_description/launch/description.launch.py)
+
+    # --- 라이다 투영 미세보정 ---
+    # URDF의 다운틸트(camera_pitch_deg=14도)는 손으로 잰 값이라 1~2도 오차가 흔하고,
+    # 화면상 1도 ≈ 10 px라서 그게 곧 "점이 살짝 틀어져 보임"으로 나타난다.
+    # 실행 중 Fusion Visualizer 창에서 i/k(pitch), j/l(yaw), u/o(roll), n/m(height)로
+    # 맞춘 뒤 p키를 누르면 아래에 붙여넣을 값이 로그로 출력된다.
+    calib_pitch_deg: 12.25      # + 면 점이 화면 위로
+    calib_yaw_deg: 0.25        # + 면 점이 화면 오른쪽으로
+    calib_roll_deg: 0.0
+    calib_height_m: 0.0       # + 면 카메라가 실제로 더 높이 달려있다는 뜻
+    calib_step_deg: 0.25
+    calib_step_m: 0.01
+    show_calib_hud: true
+
+    # 빈 탐지가 연속 이 횟수 오면 박스를 즉시 지움.
+    # 예전에는 빈 프레임을 통째로 무시해서 오탐 박스 하나가 1.5초씩 화면에 남았다.
+    det_clear_after_empty: 3
+
+    # TF를 못 쓸 때만 쓰는 폴백 (URDF 실측값과 일치시켜 둠)
+    cam_x_offset: 0.730       # 카메라에서 본 라이다 원점까지의 앞쪽 거리 [m]
+    cam_height: 0.550         # 카메라에서 본 라이다 원점까지의 아래쪽 거리 [m]
+    cam_pitch_deg: 14.0       # 카메라 다운틸트 [도]
+
+    # 판단(decision_making) 쪽으로 넘길 장애물 정보.
+    # Point32(x=가장 가까운 장애물 거리[m], y=이미지상 중심 x[px], z=감지 플래그)
+    publish_obstacle_info: true
+    obstacle_topic: /lidar_obstacle_info
+    # 차선 마스크는 박스가 화면을 가득 채워서 "코앞에 장애물" 오판을 만든다. 장애물/표시 대상에서 제외
+    obstacle_class_exclude: "lane_1,lane_2"
+    box_class_exclude: "lane_1,lane_2"
 
 l_shape_node:
   ros__parameters:
@@ -58,5 +129,156 @@ l_shape_node:
     arrow_length: 0.3
     show_text: true
     text_size: 0.15
+
+# =============================================================
+# 이하: 자율주행(drive.launch.py) 전용. minicar_sim에서 이식한 인지->판단->제어 체인
+#   /detections -> lane_info_extractor -> /yolov8_lane_info
+#   -> path_planner(lattice) -> /path_planning_result
+#   -> motion_planner(pure pursuit + PD) -> /topic_control_signal
+#   -> serial_sender -> 아두이노("C,front_pwm,rear_pwm,u")
+# =============================================================
+
+lane_info_extractor_node:
+  ros__parameters:
+    sub_detection_topic: /detections
+    sub_lidar_obstacle_topic: /lidar_obstacle_info
+    pub_topic: /yolov8_lane_info
+    roi_image_topic: /roi_image
+    show_image: true           # ROI 디버그 창(Lane Info). 헤드리스로 돌릴 땐 false
+
+    # 차선 변경 시 옆 차선까지 이동할 BEV 픽셀 거리. minicar_sim은 200, 실차ws에서는 280을 썼음
+    # 추종할 차선을 고정한다('lane_1'=좌측선 / 'lane_2'=우측선 / ''=자동 판단).
+    # 실측(주행 20초 191프레임): lane_2 단독 91.1%, 둘 다 8.9%, lane_1 단독 0%.
+    # 자동 판단을 돌리면 판정이 흔들릴 때마다 타겟이 lane_width_pixel만큼 튄다.
+    fixed_lane_class: 'lane_2'
+
+    lane_width_pixel: 280.0
+    # 이 거리[m]보다 가까운 장애물만 회피 대상 (minicar_sim은 2.4)
+    avoidance_trigger_dist: 1.8
+    shift_speed: 20.0          # 프레임당 오프셋 변화량(px). 클수록 차선 변경이 급해짐
+
+    image_center_x: 320
+    lane_1_far_left_threshold: 180.0
+    lane_2_far_right_threshold: 460.0
+    # 차선 상태(1/2차선) 전환 디바운싱. 이만큼 연속으로 잡혀야 전환한다.
+    # 1이면 minicar_sim 원본과 동일(즉시 전환). 실차는 마스크가 튀어서 15 정도가 안정적
+    lane_change_threshold_count: 15
+
+    # BEV 변환 원본 좌표 4점 (좌상x,좌상y, 우상x,우상y, 우하x,우하y, 좌하x,좌하y) - 640x480 기준.
+    # 카메라 장착 각도가 sim과 다르면 여기부터 다시 잡아야 한다 (bev_tuning 참고)
+    src_points: [154.0, 298.0, 486.0, 298.0, 614.0, 470.0, 26.0, 470.0]
+    roi_cutting_idx: 300       # BEV에서 아래쪽으로 잘라 남길 픽셀 (차 앞쪽만)
+    target_y_start: 5          # 타겟 포인트를 뽑을 ROI 이미지상 y 범위/간격
+    # ROI에서 y가 클수록 차량에 가까운 쪽이다. 가까운 행은 차선이 화각/ROI를 벗어나
+    # 한쪽 선만 걸리는데, 그러면 lane_width_for_center(300)의 절반을 더해 중심을
+    # 추정하다가 크게 튄다. 실측(131프레임): y=5/35/65는 362 대비 ±2.3으로 정확한 반면
+    # y=95는 528.7(+167), y=125는 아예 검출 실패(-1)였다.
+    # 그 쓰레기값이 경로를 오른쪽으로 당겨 PD 항에 +0.52 편향을 만들었다.
+    # 근거리 행(95/125)을 되살려 봤지만 먼 행과 70~80px 어긋난다(실측 181프레임:
+    # y=5/35/65는 237/246/252인데 y=95/125는 176/166).
+    # BEV는 원근 보정이라 행마다 스케일이 달라 실제 차선 폭이 근거리 ~125, 원거리 ~222로
+    # 변하는데, lane_width_for_center는 모든 행에 같은 값을 쓴다. 그래서 근거리에서
+    # 반드시 어긋난다. 행별 폭을 쓰도록 고치기 전에는 먼 행만 쓰는 편이 안전하다.
+    target_y_end: 95
+    target_y_step: 30
+    # BEV ROI에서 가정하는 차선 폭(px). draw_edges()가 추종 클래스 하나만 그리므로
+    # get_lane_center는 항상 선 1개만 보고 '중심 = 선위치 ± 폭/2'로 추정한다.
+    # 즉 이 값은 일부 구간이 아니라 사실상 모든 프레임에 적용된다.
+    #
+    # 300은 근거 없는 기본값이었다. 주행 실측(184프레임)에서 target_x 평균이 289.5로
+    # car_center_x(332)보다 42.5px 왼쪽에 고정돼, 조향의 85%가 한쪽으로 쏠렸다.
+    # 추정을 42px 오른쪽으로 옮기려면 폭을 84 줄이면 된다 -> 300-84 = 216.
+    # BEV 스케일로 독립 계산한 값(약 212)과도 일치한다.
+    lane_width_for_center: 216
+
+path_planner_node:
+  ros__parameters:
+    sub_lane_topic: /yolov8_lane_info
+    sub_obstacle_topic: /lidar_obstacle_info
+    pub_topic: path_planning_result
+    # 이미지상 차량 앞 범퍼 중심 픽셀. 경로의 시작점으로 쓰인다.
+    # motion_planner_node의 car_center_point와 같은 값이어야 한다 (실측 보정값 332).
+    car_center_point: [332, 179]
+
+    candidate_count: 7             # 생성할 후보 경로 개수
+    max_lattice_offset: 120.0      # 중심선 기준 좌/우 최대 오프셋(px)
+    spline_points: 100             # 최종 경로 보간 점 개수
+    obstacle_penalty_gain: 3.0     # 안전거리 침범 시 추가 감점 계수
+    lane_center_weight: 10.0       # 차선 중앙 유지 가중치
+    obstacle_weight: 20.0          # 장애물 회피 가중치
+    smoothness_weight: 10.0        # 급조향 경로 감점
+    obstacle_dist_threshold: 2.4   # 이 거리[m]보다 가까울 때만 회피 감점 적용
+    path_change_cost: 0.05         # 직전 선택 오프셋에서 멀어질수록 감점(지그재그 억제)
+    obstacle_clearance: 40.0       # 장애물과 최소 이격거리(px)
+
+    enable_lattice_debug: false    # 후보 경로 시각화용 lattice_debug 발행 (시각화 노드는 아직 없음)
+
+motion_planner_node:
+  ros__parameters:
+    sub_path_topic: path_planning_result
+    pub_topic: topic_control_signal
+    timer: 0.1                     # 제어 주기[s] (0.1 = 10Hz)
+
+    # 신호등/라이다 정지 로직. 우리 쪽엔 신호등 인식 노드가 없어서 꺼둠
+    use_traffic_lidar_stop: false
+
+    # BEV ROI 좌표계에서의 차량 중심선. 영상 정중앙(320)이 아니다.
+    # BEV src_points가 x=320 대칭이라 영상 중심은 320으로 매핑되므로, 이 차이는
+    # 카메라가 차체 중심선보다 왼쪽에 달렸다는 뜻이다. 320을 쓰면 제어기가 '카메라'를
+    # 차선 중앙에 맞추고 차체는 그만큼 치우친 채 달린다.
+    #
+    # 332는 앞바퀴에서 좌우 차선까지 거리를 자로 재서 맞춘 뒤 실측한 값
+    # (165프레임, 두 차선 모두 검출, y=5/35 행 332 / y=65 행 330).
+    # 눈대중으로 놓고 잰 값은 362, 312로 ±50px 흔들렸는데 332가 그 중간이다.
+    # 재현성은 1회 측정이라 미검증. 주행에서 한쪽으로 정상편차가 남으면 이 값을 옮기거나
+    # 제어에 적분 보정을 넣어야 한다.
+    car_center_point: [332, 179]
+    car_center_x: 332
+    vehicle_heading_rad: -1.57079632679
+
+    # Pure Pursuit
+    # 작을수록 민감, 클수록 완만.
+    # 170은 경로에서 가장 먼 점까지의 거리(차량 y=179, 최원점 y=5 -> 174px)와 거의 같아서,
+    # 사실상 그 한 점만 보고 조향했다. S자처럼 앞뒤로 휘는 구간에서 중간 형상을 못 읽고
+    # 가로지르는 원인. 중간 점들을 보도록 줄인다.
+    lookahead_distance: 120.0
+    wheelbase: 50.0
+    max_steer_angle_rad: 0.55
+    max_steer_cmd: 9.0             # serial_sender_node의 max_steer_cmd와 같은 값이어야 함
+
+    # PD 보정
+    use_pd: true
+    Kp: 0.01
+    Kd: 0.045
+    max_steer: 4.0                 # PD 보정분의 최대 절대값
+    lookahead_y: 155
+
+    # 속도 (아두이노 rear PWM으로 그대로 나감). minicar_sim 기본값은 200/100/250이지만
+    # 실차에서는 120/80/150을 썼다. 처음 굴릴 땐 낮게 시작할 것.
+    # [저속 튜닝 모드] min/max를 base와 같은 값으로 묶어 조향 감속까지 무력화해서
+    # motion_planner가 항상 정확히 이 PWM을 내보내게 한다 (motion_planner_node.py:257의
+    # clamp(base - gain*|steer|, min, max) 때문에 base만 바꾸면 min에 걸린다).
+    # 실측: PWM 50에서 잘 굴러가고 오히려 빨랐음 -> 30으로 낮춤.
+    # 너무 느리거나 stall(삐 소리만 나고 안 굴러감)이면 5씩 올릴 것.
+    # 조향 튜닝이 끝나고 정상 주행으로 돌아갈 때는 min/max를 다시 벌릴 것. 예)
+    #   base_speed: 40 / min_speed: 30 / max_speed: 55
+    base_speed: 30
+    min_speed: 30
+    max_speed: 30
+    steer_speed_gain: 12.0         # 조향이 클수록 감속시키는 계수
+
+serial_sender_node:
+  ros__parameters:
+    sub_topic: topic_control_signal
+    port: /dev/ttyACM0             # 아두이노 포트 (ls /dev/ttyACM* 로 확인)
+    baudrate: 115200
+    max_steer_cmd: 9.0             # motion_planner_node의 max_steer_cmd와 같아야 함
+    steering_pwm_max: 150          # 미사용. 아두이노는 조향을 -1.0~1.0 정규화 값으로 받는다
+    # 실측 확인: 조향을 +1/-1로 3회 왕복(pot 584 <-> 437)시키고 앞바퀴를 관측한 결과
+    # 명령 순서 + - + - + - 에 대해 왼 오 왼 오 로 움직였다.
+    # 즉 양(+) 명령 = 좌회전이다. motion_planner는 양수를 우회전으로 쓰므로 뒤집어야 한다.
+    # (이 값을 검증 없이 false로 두고 진행하는 바람에, 제어기가 보정할 때마다
+    #  반대로 밀려서 차가 한쪽으로 계속 흘러갔다)
+    steer_invert: true             # 조향이 반대로 먹으면 true
 
     launch_rviz: true

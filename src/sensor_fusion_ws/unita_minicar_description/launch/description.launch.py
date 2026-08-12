@@ -3,17 +3,26 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 # 카메라가 지면 쪽으로 내려다보는 각도(도, 실측값). URDF의 camera_joint는 rpy가 전부 0이라
 # 실제 다운틸트가 반영돼 있지 않음. URDF 파일 자체는 건드리지 않고, camera_link 아래에
 # 이 각도만큼 기운 자식 프레임(camera_link_tilted)을 별도 static TF로 추가해서 보정한다.
-CAMERA_PITCH_DEG = 14.0
+#
+# 이 값은 손으로 잰 값이라 1~2도 오차가 흔한데, 화면상 1도 ≈ 10 px라서 그게 곧
+# 라이다 투영이 "살짝 위/아래로 틀어져 보이는" 원인이 된다. 각도 자체를 다시 재는 대신,
+# image_fusion_node의 calib_pitch_deg로 잔차만 걷어내는 쪽이 실용적이다
+# (Fusion Visualizer 창에서 i/k 키로 맞춘 뒤 p키로 값 출력 -> params.yaml에 기록).
+DEFAULT_CAMERA_PITCH_DEG = 14.0
 
 
-def generate_launch_description():
+def _nodes(context, *args, **kwargs):
     pkg_share = get_package_share_directory('unita_minicar_description')
     urdf_path = os.path.join(pkg_share, 'urdf', 'unita_minicar.urdf')
+
+    camera_pitch_deg = float(LaunchConfiguration('camera_pitch_deg').perform(context))
 
     with open(urdf_path, 'r') as f:
         robot_description = f.read()
@@ -37,7 +46,7 @@ def generate_launch_description():
         name='camera_tilt_static_tf',
         arguments=[
             '--x', '0', '--y', '0', '--z', '0',
-            '--roll', '0', '--pitch', str(math.radians(CAMERA_PITCH_DEG)), '--yaw', '0',
+            '--roll', '0', '--pitch', str(math.radians(camera_pitch_deg)), '--yaw', '0',
             '--frame-id', 'camera_link',
             '--child-frame-id', 'camera_link_tilted',
         ],
@@ -59,8 +68,17 @@ def generate_launch_description():
         ],
     )
 
-    return LaunchDescription([
+    return [
         robot_state_publisher_node,
         camera_tilt_tf_node,
         camera_optical_tilted_tf_node,
+    ]
+
+
+def generate_launch_description():
+    return LaunchDescription([
+        DeclareLaunchArgument(
+            'camera_pitch_deg', default_value=str(DEFAULT_CAMERA_PITCH_DEG),
+            description='카메라 다운틸트(도). 실측값이 바뀌면 소스를 고치지 말고 이 인자로 넘길 것'),
+        OpaqueFunction(function=_nodes),
     ])

@@ -9,7 +9,7 @@ from typing import Tuple, Optional
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import TransformStamped, Point32
 from tf2_ros import Buffer, TransformListener
 
 from sensor_msgs.msg import Image, LaserScan
@@ -17,6 +17,14 @@ from cv_bridge import CvBridge
 from std_msgs.msg import Header
 
 from interfaces_pkg.msg import DetectionArray
+
+# 투영 수식은 calibration_node(정렬 도구)와 공유한다 - 한쪽만 고쳐서
+# 두 화면이 다르게 보이는 일을 막기 위함
+from lidar_camera_fusion_pkg.calibration_utils import (
+    apply_calibration,
+    build_fallback_extrinsic,
+    quaternion_to_matrix,
+)
 
 
 WINDOW_NAME = 'Fusion Visualizer'
@@ -35,6 +43,19 @@ SECONDARY_KEYS = {
     ord('e'): 'boxes',
     ord('r'): 'bev',
     ord('t'): 'bev_roi',
+}
+
+# 라이다 투영 정렬(캘리브레이션) 실시간 보정 키.
+# (키, 보정항목, 부호) - 부호는 "화면에서 점이 움직이는 방향" 기준으로 직관적이게 맞춰둠
+CALIB_KEYS = {
+    ord('i'): ('pitch', +1.0),   # 점을 위로
+    ord('k'): ('pitch', -1.0),   # 점을 아래로
+    ord('j'): ('yaw',   -1.0),   # 점을 왼쪽으로
+    ord('l'): ('yaw',   +1.0),   # 점을 오른쪽으로
+    ord('u'): ('roll',  -1.0),
+    ord('o'): ('roll',  +1.0),
+    ord('n'): ('height', -1.0),  # 카메라가 실제로 더 낮게 달림 -> 점이 위로
+    ord('m'): ('height', +1.0),  # 카메라가 실제로 더 높게 달림 -> 점이 아래로
 }
 MODE_LABELS = {
     'raw': 'Raw Camera',
@@ -69,6 +90,18 @@ class FusionVisualizerNode(Node):
         self.declare_parameter('publish_annotated', False)
         self.declare_parameter('annotated_topic', '/fusion/annotated_image')
         self.declare_parameter('display', True)
+
+        # 판단(decision_making) 쪽에 넘길 장애물 정보.
+        # Point32(x=가장 가까운 장애물까지 거리[m], y=그 박스의 이미지상 중심 x[px], z=감지 플래그)
+        # 포맷으로 /lidar_obstacle_info를 발행한다 (minicar_sim의 box_lidar_match_node와 동일 포맷).
+        self.declare_parameter('publish_obstacle_info', False)
+        self.declare_parameter('obstacle_topic', '/lidar_obstacle_info')
+        # 장애물로 치지 않을 클래스. 차선 세그멘테이션(lane_1/lane_2)은 박스가 화면을 가득 채워서
+        # 그대로 두면 "코앞에 장애물이 있다"고 잘못 나간다.
+        self.declare_parameter('obstacle_class_exclude', 'lane_1,lane_2')
+        # 'boxes' 화면에서 박스를 그리지 않을 클래스 (차선 마스크 박스는 화면을 다 가림)
+        self.declare_parameter('box_class_exclude', 'lane_1,lane_2')
+
         self.declare_parameter('window_width', 960)
         self.declare_parameter('window_height', 720)
 
@@ -83,11 +116,35 @@ class FusionVisualizerNode(Node):
         # -------------------------
         # Extrinsic (LiDAR -> Camera)
         # -------------------------
-        self.declare_parameter('cam_x_offset', 0.0)
-        self.declare_parameter('cam_height', 0.032)
+        # TF(URDF)를 못 쓸 때만 사용하는 폴백 값. URDF(unita_minicar.urdf)의 실제 장착 위치와
+        # 맞춰둔다 - 예전 기본값(0.032 / 0.0)은 URDF와 전혀 달라서, TF가 안 뜨면 투영이
+        # 조용히 엉뚱한 곳으로 나갔다.
+        #   laser:  base_link 기준 x=+0.500, z=0.119
+        #   camera: base_link 기준 x=-0.230, z=0.669
+        #   -> 라이다 원점은 카메라보다 0.730 m 앞, 0.550 m 아래
+        # (둘 다 "카메라에서 본 라이다 원점의 위치"이므로 양수)
+        self.declare_parameter('cam_x_offset', 0.730)
+        self.declare_parameter('cam_height', 0.550)
+        # 폴백 경로에서만 쓰는 카메라 다운틸트(도). TF 경로에서는 static TF가 이미 반영함.
+        self.declare_parameter('cam_pitch_deg', 14.0)
         self.declare_parameter('use_urdf_extrinsic', True)
         self.declare_parameter('lidar_frame_id', 'laser')
         self.declare_parameter('camera_frame_id', 'camera_link')
+
+        # -------------------------
+        # Extrinsic 미세보정 (실차에서 창을 보며 키로 맞춘 뒤 params.yaml에 적어두는 값)
+        # 부호는 "화면에서 라이다 점이 움직이는 방향" 기준:
+        #   pitch +  -> 점이 위로 / yaw +  -> 점이 오른쪽으로
+        #   height + -> 카메라가 실제로 더 높이 달려있다는 뜻(가까운 점이 아래로)
+        # 각도 1도 ≈ 화면상 약 10 px (fy≈567 기준) 이므로, 몇 도만 틀려도 눈에 띈다.
+        # -------------------------
+        self.declare_parameter('calib_pitch_deg', 0.0)
+        self.declare_parameter('calib_yaw_deg', 0.0)
+        self.declare_parameter('calib_roll_deg', 0.0)
+        self.declare_parameter('calib_height_m', 0.0)
+        self.declare_parameter('calib_step_deg', 0.25)    # 키 한 번당 각도 변화량
+        self.declare_parameter('calib_step_m', 0.01)      # 키 한 번당 높이 변화량
+        self.declare_parameter('show_calib_hud', True)    # 화면에 현재 보정값 표시
 
         # -------------------------
         # LiDAR filtering / projection
@@ -111,6 +168,8 @@ class FusionVisualizerNode(Node):
         # CPU에서 2개 모델을 순차 추론하다 보니 프레임당 지연이 들쭉날쭉할 수 있음.
         # 너무 짧으면 추론이 살짝 느려질 때마다 박스가 깜빡이므로 여유 있게 잡음.
         self.declare_parameter('max_age_det', 1.5)
+        # 빈 탐지 프레임이 연속 이 횟수만큼 오면 박스를 즉시 지움 (오탐이 오래 남는 것 방지)
+        self.declare_parameter('det_clear_after_empty', 3)
         self.declare_parameter('max_age_bev', 1.5)
         self.declare_parameter('max_age_bev_roi', 1.5)
 
@@ -124,6 +183,16 @@ class FusionVisualizerNode(Node):
         self.publish_annotated = bool(self.get_parameter('publish_annotated').value)
         self.annotated_topic = self.get_parameter('annotated_topic').value
         self.display = bool(self.get_parameter('display').value)
+
+        self.publish_obstacle_info = bool(self.get_parameter('publish_obstacle_info').value)
+        self.obstacle_topic = str(self.get_parameter('obstacle_topic').value)
+        self.obstacle_class_exclude = {
+            c.strip() for c in str(self.get_parameter('obstacle_class_exclude').value).split(',') if c.strip()
+        }
+        self.box_class_exclude = {
+            c.strip() for c in str(self.get_parameter('box_class_exclude').value).split(',') if c.strip()
+        }
+
         self.window_width = int(self.get_parameter('window_width').value)
         self.window_height = int(self.get_parameter('window_height').value)
 
@@ -143,7 +212,23 @@ class FusionVisualizerNode(Node):
 
         dist = float(self.get_parameter('cam_x_offset').value)
         height = float(self.get_parameter('cam_height').value)
-        self.extrinsic_mat = self._init_extrinsic(dist, height, self.front_angle_deg)
+        cam_pitch = float(self.get_parameter('cam_pitch_deg').value)
+        # TF에서 읽어온(또는 폴백으로 만든) 보정 전 원본 extrinsic
+        self.base_extrinsic_mat = self._init_extrinsic(
+            dist, height, self.front_angle_deg, cam_pitch)
+        self.tf_ok = False
+        self.tf_warned = False
+
+        self.calib_pitch_deg = float(self.get_parameter('calib_pitch_deg').value)
+        self.calib_yaw_deg = float(self.get_parameter('calib_yaw_deg').value)
+        self.calib_roll_deg = float(self.get_parameter('calib_roll_deg').value)
+        self.calib_height_m = float(self.get_parameter('calib_height_m').value)
+        self.calib_step_deg = float(self.get_parameter('calib_step_deg').value)
+        self.calib_step_m = float(self.get_parameter('calib_step_m').value)
+        self.show_calib_hud = bool(self.get_parameter('show_calib_hud').value)
+
+        self.extrinsic_mat = self._apply_calibration(self.base_extrinsic_mat)
+
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -168,6 +253,7 @@ class FusionVisualizerNode(Node):
 
         self.max_age_scan = float(self.get_parameter('max_age_scan').value)
         self.max_age_det = float(self.get_parameter('max_age_det').value)
+        self.det_clear_after_empty = int(self.get_parameter('det_clear_after_empty').value)
         self.max_age_bev = float(self.get_parameter('max_age_bev').value)
         self.max_age_bev_roi = float(self.get_parameter('max_age_bev_roi').value)
 
@@ -179,6 +265,7 @@ class FusionVisualizerNode(Node):
 
         self.last_det: Optional[DetectionArray] = None
         self.last_det_time = None
+        self.empty_det_count = 0
 
         self.last_bev: Optional[np.ndarray] = None
         self.last_bev_time = None
@@ -187,6 +274,7 @@ class FusionVisualizerNode(Node):
         self.last_bev_roi_time = None
 
         self.last_img_time = None
+        self._cur_scan_age = None
 
         # Subscribers (QoS: sensor_data로 고정)
         self.create_subscription(Image, self.image_topic, self.image_cb, qos_profile_sensor_data)
@@ -201,6 +289,11 @@ class FusionVisualizerNode(Node):
         else:
             self.pub_img = None
 
+        if self.publish_obstacle_info:
+            self.pub_obstacle = self.create_publisher(Point32, self.obstacle_topic, 10)
+        else:
+            self.pub_obstacle = None
+
         if self.display:
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(WINDOW_NAME, self.window_width, self.window_height)
@@ -211,6 +304,8 @@ class FusionVisualizerNode(Node):
         self.get_logger().info(
             "1:raw 2:lidar 3:boxes 4:bev 5:bev_roi (주화면) | q/w/e/r/t: 보조화면 | "
             "v: 분할보기 토글 - 창을 클릭한 뒤 키 입력\n"
+            "[정렬 보정] i/k:pitch(점 위/아래) j/l:yaw(점 왼/오른쪽) u/o:roll n/m:height "
+            "[/]:스텝 0:초기화 p:현재값 출력\n"
             f"FusionVisualizerNode started.\n"
             f"  image_topic={self.image_topic}\n"
             f"  scan_topic={self.scan_topic}\n"
@@ -222,6 +317,7 @@ class FusionVisualizerNode(Node):
 
     def _try_update_extrinsic_from_tf(self) -> None:
         if not self.use_urdf_extrinsic:
+            self.extrinsic_mat = self._apply_calibration(self.base_extrinsic_mat)
             return
 
         try:
@@ -230,8 +326,26 @@ class FusionVisualizerNode(Node):
                 self.lidar_frame_id,
                 rclpy.time.Time()
             )
-        except Exception:
+        except Exception as e:
+            # 예전에는 여기서 조용히 return 해버려서, TF가 안 뜨면 URDF와 전혀 다른
+            # 폴백 extrinsic으로 계속 투영되는데도 아무 경고가 없었다.
+            if not self.tf_warned:
+                self.get_logger().warn(
+                    f"TF '{self.lidar_frame_id}' -> '{self.camera_frame_id}' 조회 실패 ({e}). "
+                    f"URDF 대신 폴백 extrinsic(cam_x_offset/cam_height)으로 투영 중 - 정렬이 어긋납니다. "
+                    f"unita_minicar_description의 description.launch.py(robot_state_publisher + "
+                    f"camera tilt static TF)가 떠 있는지 확인하세요."
+                )
+                self.tf_warned = True
+            self.tf_ok = False
+            self.extrinsic_mat = self._apply_calibration(self.base_extrinsic_mat)
             return
+
+        if not self.tf_ok:
+            self.get_logger().info(
+                f"TF extrinsic 적용: '{self.lidar_frame_id}' -> '{self.camera_frame_id}'")
+        self.tf_ok = True
+        self.tf_warned = False
 
         translation = transform.transform.translation
         rotation = transform.transform.rotation
@@ -243,41 +357,48 @@ class FusionVisualizerNode(Node):
         ext = np.eye(4, dtype=np.float64)
         ext[:3, :3] = rot_mat
         ext[:3, 3] = t_vec
-        self.extrinsic_mat = ext
+
+        self.base_extrinsic_mat = ext
+        self.extrinsic_mat = self._apply_calibration(ext)
+
+    def _apply_calibration(self, ext: np.ndarray) -> np.ndarray:
+        """실측 미세보정을 덧씌운다 (수식은 calibration_utils와 공유)."""
+        return apply_calibration(ext, self.calib_pitch_deg, self.calib_yaw_deg,
+                                 self.calib_roll_deg, self.calib_height_m)
+
+    def _bump_calibration(self, field: str, sign: float) -> None:
+        if field == 'pitch':
+            self.calib_pitch_deg += sign * self.calib_step_deg
+        elif field == 'yaw':
+            self.calib_yaw_deg += sign * self.calib_step_deg
+        elif field == 'roll':
+            self.calib_roll_deg += sign * self.calib_step_deg
+        elif field == 'height':
+            self.calib_height_m += sign * self.calib_step_m
+        self.extrinsic_mat = self._apply_calibration(self.base_extrinsic_mat)
+        self.get_logger().info(
+            f"보정: pitch={self.calib_pitch_deg:+.2f}deg yaw={self.calib_yaw_deg:+.2f}deg "
+            f"roll={self.calib_roll_deg:+.2f}deg height={self.calib_height_m:+.3f}m")
+
+    def _log_calibration_block(self) -> None:
+        """현재 보정값을 params.yaml에 그대로 붙여넣을 수 있는 형태로 출력."""
+        self.get_logger().info(
+            "\n===== params.yaml의 image_fusion_node: ros__parameters: 아래에 붙여넣기 =====\n"
+            f"    calib_pitch_deg: {self.calib_pitch_deg:.2f}\n"
+            f"    calib_yaw_deg: {self.calib_yaw_deg:.2f}\n"
+            f"    calib_roll_deg: {self.calib_roll_deg:.2f}\n"
+            f"    calib_height_m: {self.calib_height_m:.3f}\n"
+            "==========================================================================")
 
     @staticmethod
     def _quaternion_to_matrix(q) -> np.ndarray:
-        x, y, z, w = q
-        return np.array([
-            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
-        ], dtype=np.float64)
+        return quaternion_to_matrix(q)
 
     @staticmethod
-    def _init_extrinsic(dist: float, height: float, front_angle_deg: float) -> np.ndarray:
-        t_vec = np.array([0.0, height, dist], dtype=np.float64).reshape(3, 1)
-
-        R_axis_swap = np.array([
-            [0.0, -1.0, 0.0],
-            [0.0,  0.0, -1.0],
-            [1.0,  0.0, 0.0]
-        ], dtype=np.float64)
-
-        # front_angle_deg 값 하나로 yaw 회전을 생성 (FOV 필터와 동일한 기준 공유)
-        theta = math.radians(front_angle_deg)
-        R_yaw = np.array([
-            [math.cos(theta), -math.sin(theta), 0.0],
-            [math.sin(theta),  math.cos(theta), 0.0],
-            [0.0,              0.0,             1.0]
-        ], dtype=np.float64)
-
-        R = R_axis_swap @ R_yaw
-
-        ext = np.eye(4, dtype=np.float64)
-        ext[:3, :3] = R
-        ext[:3, 3] = t_vec.flatten()
-        return ext
+    def _init_extrinsic(dist: float, height: float, front_angle_deg: float,
+                        cam_pitch_deg: float = 0.0) -> np.ndarray:
+        """TF를 못 쓸 때의 폴백 extrinsic (수식은 calibration_utils와 공유)."""
+        return build_fallback_extrinsic(dist, height, front_angle_deg, cam_pitch_deg)
 
     def debug_timer(self):
         now = self.get_clock().now()
@@ -303,10 +424,17 @@ class FusionVisualizerNode(Node):
 
     def det_cb(self, msg: DetectionArray):
         # yolov8_node는 탐지가 하나도 없는 프레임에도 빈 DetectionArray를 계속 발행한다.
-        # 여기서 그걸 그대로 반영하면 박스가 매 프레임 깜빡이므로, 빈 메시지는 무시하고
-        # max_age_det 타임아웃이 지났을 때만 박스가 사라지게 한다.
+        # 매 프레임 그대로 반영하면 박스가 깜빡이므로 빈 메시지를 한 번은 무시하되,
+        # 예전처럼 max_age_det(1.5 s)까지 통째로 버티게 두면 오탐 박스 하나가 1.5초씩
+        # 화면에 남아버린다. 빈 프레임이 연속 N번 오면 바로 지운다.
         if len(msg.detections) == 0:
+            self.empty_det_count += 1
+            if self.empty_det_count >= self.det_clear_after_empty:
+                self.last_det = None
+                self.last_det_time = None
             return
+
+        self.empty_det_count = 0
         self.last_det = msg
         self.last_det_time = self.get_clock().now()
 
@@ -351,6 +479,9 @@ class FusionVisualizerNode(Node):
         if self.last_scan is not None and self.last_scan_time is not None:
             scan_age = (now - self.last_scan_time).nanoseconds / 1e9
             scan_ok = (scan_age <= self.max_age_scan)
+            # 오래된 스캔을 현재 프레임에 그대로 겹치면, 차가 움직일 때 그만큼 점이 밀린다.
+            # (라이다 10 Hz 기준 0.1 s만 밀려도 회전 중에는 눈에 띄게 어긋남)
+            self._cur_scan_age = scan_age
 
         if self.last_det is not None and self.last_det_time is not None:
             det_age = (now - self.last_det_time).nanoseconds / 1e9
@@ -371,8 +502,12 @@ class FusionVisualizerNode(Node):
         v_pix = np.array([], dtype=np.int32)
         ranges = np.array([], dtype=np.float64)
 
-        if scan_ok and (needed_modes & {'lidar', 'boxes'}):
+        # 화면에 안 그리는 모드여도 장애물 정보를 발행해야 하면 투영은 해야 한다
+        if scan_ok and ((needed_modes & {'lidar', 'boxes'}) or self.publish_obstacle_info):
             u_pix, v_pix, ranges = self.project_scan_to_image(self.last_scan, w, h)
+
+        if self.publish_obstacle_info:
+            self._publish_obstacle_info(det_ok, scan_ok, u_pix, v_pix, ranges, w, h)
 
         # 4) 화면 모드별 프레임 생성 (분할뷰면 주+보조 2장, 아니면 주화면 1장)
         display = self._render_mode(
@@ -393,9 +528,31 @@ class FusionVisualizerNode(Node):
             elif key in SECONDARY_KEYS:
                 self.secondary = SECONDARY_KEYS[key]
                 self.get_logger().info(f'보조화면: {self.secondary}')
+            elif key in CALIB_KEYS:
+                field, sign = CALIB_KEYS[key]
+                self._bump_calibration(field, sign)
             elif key == ord('v'):
                 self.split_view = not self.split_view
                 self.get_logger().info(f'분할보기: {self.split_view}')
+            elif key == ord('p'):
+                self._log_calibration_block()
+            elif key == ord('0'):
+                self.calib_pitch_deg = 0.0
+                self.calib_yaw_deg = 0.0
+                self.calib_roll_deg = 0.0
+                self.calib_height_m = 0.0
+                self.extrinsic_mat = self._apply_calibration(self.base_extrinsic_mat)
+                self.get_logger().info('보정값 초기화')
+            elif key == ord('['):
+                self.calib_step_deg = max(0.05, self.calib_step_deg / 2.0)
+                self.calib_step_m = max(0.002, self.calib_step_m / 2.0)
+                self.get_logger().info(
+                    f'보정 스텝: {self.calib_step_deg:.2f}deg / {self.calib_step_m:.3f}m')
+            elif key == ord(']'):
+                self.calib_step_deg = min(5.0, self.calib_step_deg * 2.0)
+                self.calib_step_m = min(0.2, self.calib_step_m * 2.0)
+                self.get_logger().info(
+                    f'보정 스텝: {self.calib_step_deg:.2f}deg / {self.calib_step_m:.3f}m')
 
         if self.pub_img is not None:
             out_msg = self.bridge.cv2_to_imgmsg(display, encoding='bgr8')
@@ -404,6 +561,57 @@ class FusionVisualizerNode(Node):
             out_msg.header.frame_id = img_msg.header.frame_id
             self.pub_img.publish(out_msg)
 
+    def _publish_obstacle_info(self, det_ok, scan_ok, u_pix, v_pix, ranges, w, h):
+        """가장 가까운 장애물을 Point32(x=거리[m], y=이미지상 중심 x[px], z=감지 플래그)로 발행.
+
+        박스별 거리는 화면 표시와 똑같이 estimate_distance_in_bbox()로 구하므로,
+        'boxes' 화면에 찍히는 거리와 판단 노드가 받는 거리가 항상 같다.
+        obstacle_class_exclude에 든 클래스(기본: 차선)는 장애물로 치지 않는다.
+        """
+        closest_dist = None
+        closest_cx = -1.0
+
+        if det_ok and scan_ok and len(ranges) > 0:
+            for det in self.last_det.detections:
+                if str(getattr(det, 'class_name', '')) in self.obstacle_class_exclude:
+                    continue
+
+                bbox = det.bbox
+                box_cx = float(bbox.center.position.x)
+                box_cy = float(bbox.center.position.y)
+                bw = float(bbox.size.x)
+                bh = float(bbox.size.y)
+
+                x1 = int(box_cx - bw / 2.0)
+                y1 = int(box_cy - bh / 2.0)
+                x2 = int(box_cx + bw / 2.0)
+                y2 = int(box_cy + bh / 2.0)
+
+                x1c = max(0, min(w - 1, x1))
+                y1c = max(0, min(h - 1, y1))
+                x2c = max(0, min(w - 1, x2))
+                y2c = max(0, min(h - 1, y2))
+
+                dist_m, _ = self.estimate_distance_in_bbox(u_pix, v_pix, ranges, x1c, y1c, x2c, y2c)
+                if dist_m is None:
+                    continue
+
+                if closest_dist is None or dist_m < closest_dist:
+                    closest_dist = dist_m
+                    closest_cx = (x1c + x2c) / 2.0
+
+        obs_msg = Point32()
+        if closest_dist is not None:
+            obs_msg.x = float(closest_dist)
+            obs_msg.y = float(closest_cx)
+            obs_msg.z = 1.0
+        else:
+            obs_msg.x = -1.0
+            obs_msg.y = -1.0
+            obs_msg.z = 0.0
+
+        self.pub_obstacle.publish(obs_msg)
+
     def _render_mode(self, mode, img, w, h, scan_ok, det_ok, bev_ok, bev_roi_ok, u_pix, v_pix, ranges) -> np.ndarray:
         if mode == 'raw':
             frame = img.copy()
@@ -411,13 +619,16 @@ class FusionVisualizerNode(Node):
         elif mode == 'lidar':
             frame = img.copy()
             if scan_ok:
-                self.draw_projected_points(frame, u_pix, v_pix)
+                self.draw_projected_points(frame, u_pix, v_pix, ranges)
 
         elif mode == 'boxes':
             frame = img.copy()
             if det_ok:
                 for det in self.last_det.detections:
                     class_name = getattr(det, 'class_name', 'Unknown')
+                    # 차선 세그멘테이션 박스는 화면을 가려서 거리 표시가 안 보이므로 그리지 않음
+                    if str(class_name) in self.box_class_exclude:
+                        continue
                     score = float(getattr(det, 'score', 0.0))
 
                     bbox = det.bbox
@@ -465,7 +676,32 @@ class FusionVisualizerNode(Node):
 
         cv2.putText(frame, MODE_LABELS[mode], (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        if self.show_calib_hud and mode in ('lidar', 'boxes'):
+            self._draw_calib_hud(frame, scan_ok)
         return frame
+
+    def _draw_calib_hud(self, frame, scan_ok: bool) -> None:
+        """정렬을 맞추는 동안 현재 보정값/스캔 지연을 화면에 표시."""
+        h = frame.shape[0]
+        src = 'TF' if (self.use_urdf_extrinsic and self.tf_ok) else 'FALLBACK'
+        lines = [
+            f"calib  pitch {self.calib_pitch_deg:+.2f}  yaw {self.calib_yaw_deg:+.2f}"
+            f"  roll {self.calib_roll_deg:+.2f}  h {self.calib_height_m:+.3f}",
+            f"step {self.calib_step_deg:.2f}deg/{self.calib_step_m:.3f}m   ext:{src}",
+            "i/k pitch  j/l yaw  u/o roll  n/m height  [/] step  0 reset  p print",
+        ]
+        if scan_ok and self._cur_scan_age is not None:
+            warn = "  <-- 지연 큼(움직이면 어긋남)" if self._cur_scan_age > 0.15 else ""
+            lines.append(f"scan age {self._cur_scan_age * 1000:.0f} ms{warn}")
+
+        y = h - 8 - 18 * (len(lines) - 1)
+        for line in lines:
+            cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (0, 255, 255), 1, cv2.LINE_AA)
+            y += 18
 
     @staticmethod
     def _bev_placeholder(shape, text: str) -> np.ndarray:
@@ -475,7 +711,7 @@ class FusionVisualizerNode(Node):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
         return frame
 
-    def draw_projected_points(self, img, u_pix, v_pix):
+    def draw_projected_points(self, img, u_pix, v_pix, ranges=None):
         if len(u_pix) == 0:
             return
 
@@ -486,7 +722,14 @@ class FusionVisualizerNode(Node):
 
             u = int(u_pix[idx])
             v = int(v_pix[idx])
-            cv2.circle(img, (u, v), 2, (0, 0, 255), -1)
+            # 거리별로 색을 달리해서, 어떤 점이 어떤 물체인지 눈으로 대응시키기 쉽게 함
+            # (정렬 보정할 때 콘 위에 어느 점이 찍혀야 하는지 판단하는 용도)
+            if ranges is not None and idx < len(ranges):
+                t = float(np.clip(ranges[idx] / max(self.max_range, 1e-3), 0.0, 1.0))
+                color = (int(255 * t), 80, int(255 * (1.0 - t)))  # 가까움=빨강, 멂=파랑
+            else:
+                color = (0, 0, 255)
+            cv2.circle(img, (u, v), 2, color, -1)
 
     def _draw_box_with_label(self, img, x1, y1, x2, y2, color, text, best_uv):
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
@@ -561,8 +804,9 @@ class FusionVisualizerNode(Node):
         u = pix[0, :] / pix[2, :]
         v = pix[1, :] / pix[2, :]
 
-        u_i = u.astype(np.int32)
-        v_i = v.astype(np.int32)
+        # astype은 0쪽으로 버림이라 좌우가 비대칭으로 밀린다. 반올림으로 교체.
+        u_i = np.rint(u).astype(np.int32)
+        v_i = np.rint(v).astype(np.int32)
 
         inside = (u_i >= 0) & (u_i < img_w) & (v_i >= 0) & (v_i < img_h)
         return u_i[inside], v_i[inside], ranges_v[inside]

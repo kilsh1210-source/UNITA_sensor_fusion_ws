@@ -19,3 +19,12 @@ __pycache__/
 # Temporary files
 *.swp
 *~
+
+# 설정 백업본 (실수로 커밋되지 않도록)
+*.yaml.bak
+
+# 에이전트 작업 디렉토리
+src/.claude/
+
+# PlatformIO 빌드 산출물
+firmware/**/.pio/

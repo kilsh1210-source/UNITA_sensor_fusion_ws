@@ -12,9 +12,17 @@
   <depend>std_msgs</depend>
   <depend>cv_bridge</depend>
   <depend>interfaces_pkg</depend>
+  <!-- image_fusion_node가 tf2_ros(Buffer/TransformListener)를 쓰는데 선언이 빠져 있었음 -->
+  <depend>tf2_ros</depend>
+  <depend>geometry_msgs</depend>
 
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
+  <!-- fusion_bringup.launch.py가 sensor_fusion_bringup의 params.yaml을 읽음.
+       단, sensor_fusion_bringup -> lidar_camera_fusion_pkg 의존이 이미 있어서
+       여기서 sensor_fusion_bringup을 depend로 걸면 순환이 된다. 그래서 launch 쪽에서
+       try/except로 처리하고(없으면 하드코딩 폴백) 의존은 걸지 않는다. -->
+  <exec_depend>python3-yaml</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>rplidar_ros</exec_depend>
