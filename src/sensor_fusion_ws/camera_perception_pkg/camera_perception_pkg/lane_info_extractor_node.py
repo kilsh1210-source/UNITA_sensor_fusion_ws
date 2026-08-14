@@ -18,13 +18,14 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image
-from geometry_msgs.msg import Point32
+from geometry_msgs.msg import Point32, Polygon
 from interfaces_pkg.msg import TargetPoint, LaneInfo, DetectionArray
 from .lib import camera_perception_func_lib as CPFL
 
 #---------------Constant Variables---------------
 SUB_TOPIC_NAME = "/detections"
-SUB_OBSTACLE_TOPIC = "/lidar_obstacle_info"
+SUB_OBSTACLE_TOPIC = "/lidar_obstacle_info"        # 가장 가까운 장애물 1개 (호환용)
+SUB_OBSTACLE_ARRAY_TOPIC = "/lidar_obstacle_array"  # 검출된 장애물 전부
 PUB_TOPIC_NAME = "/yolov8_lane_info"
 ROI_IMAGE_TOPIC_NAME = "/roi_image"
 SHOW_IMAGE = True
@@ -37,6 +38,10 @@ LANE_2_FAR_RIGHT_THRESHOLD = 460
 # 차선 상태(1차선/2차선) 전환 디바운싱: 새 상태가 이만큼 연속으로 잡혀야 실제로 전환한다.
 # 1이면 minicar_sim 원본과 동일(즉시 전환), 실차에서는 마스크가 튀어서 15 정도가 안정적.
 LANE_CHANGE_THRESHOLD_COUNT = 15
+# 회피 오프셋 해제 디바운싱: 장애물이 현재 차선과 안 겹치는 게 이만큼 연속 확인돼야 복귀.
+# 트리거는 즉시 반응하되, 해제만 보수적으로 — 근접 구간에서 YOLO 인식이 끊기는 걸
+# "장애물이 사라짐"으로 착각해 조기 복귀하다 장애물을 들이받는 사고를 막기 위함.
+AVOIDANCE_RELEASE_THRESHOLD_COUNT = 15
 
 # BEV 변환용 원본 이미지 좌표 4점 (좌상, 우상, 우하, 좌하) - 640x480 기준
 SRC_POINTS = [154.0, 298.0, 486.0, 298.0, 614.0, 470.0, 26.0, 470.0]
@@ -45,6 +50,11 @@ TARGET_Y_START = 5          # 타겟 포인트를 뽑을 y 시작/끝/간격 (RO
 TARGET_Y_END = 155
 TARGET_Y_STEP = 30
 LANE_WIDTH_FOR_CENTER = 300  # get_lane_center가 한쪽 선만 보일 때 가정하는 차선 폭(px)
+# 아래 둘은 타겟 위치를 바꾸는 값이라 기본값이 전부 '예전 동작'이다.
+# LANE_WIDTH_FOR_CENTER가 이 둘이 꺼진 상태에서 실측으로 역산된 값이기 때문.
+# 자세한 내용은 camera_perception_func_lib.get_lane_center()
+LANE_CENTER_TILT_COMP = 0.0        # 차선 기울기(cos) 보정 강도. 0.0=없음, 1.0=완전
+LANE_CENTER_FORCE_SINGLE_LINE = False  # '두 선 보임' 분기 차단 여부
 #----------------------------------------------
 
 class Yolov8InfoExtractor(Node):
@@ -53,6 +63,8 @@ class Yolov8InfoExtractor(Node):
         self.sub_topic = self.declare_parameter('sub_detection_topic', SUB_TOPIC_NAME).value
         self.pub_topic = self.declare_parameter('pub_topic', PUB_TOPIC_NAME).value
         self.sub_obstacle_topic = self.declare_parameter('sub_lidar_obstacle_topic', SUB_OBSTACLE_TOPIC).value
+        self.sub_obstacle_array_topic = self.declare_parameter(
+            'sub_lidar_obstacle_array_topic', SUB_OBSTACLE_ARRAY_TOPIC).value
         self.roi_image_topic = self.declare_parameter('roi_image_topic', ROI_IMAGE_TOPIC_NAME).value
         self.show_image = bool(self.declare_parameter('show_image', SHOW_IMAGE).value)
 
@@ -67,6 +79,11 @@ class Yolov8InfoExtractor(Node):
             self.declare_parameter('lane_2_far_right_threshold', float(LANE_2_FAR_RIGHT_THRESHOLD)).value)
         self.lane_change_threshold_count = int(
             self.declare_parameter('lane_change_threshold_count', LANE_CHANGE_THRESHOLD_COUNT).value)
+        # 회피 오프셋 "해제" 디바운싱. 장애물이 현재 차선과 확실히 안 겹치는 게 이만큼
+        # 연속으로 확인돼야 원래 차선으로 복귀한다. 트리거(회피 시작)는 디바운싱 없이 즉시.
+        # 자세한 이유는 아래 yolov8_detections_callback()의 회피 판단부 주석 참고.
+        self.avoidance_release_threshold_count = int(
+            self.declare_parameter('avoidance_release_threshold_count', AVOIDANCE_RELEASE_THRESHOLD_COUNT).value)
 
         src_flat = list(self.declare_parameter('src_points', SRC_POINTS).value)
         self.src_mat = [[int(round(src_flat[i])), int(round(src_flat[i + 1]))] for i in range(0, 8, 2)]
@@ -76,11 +93,17 @@ class Yolov8InfoExtractor(Node):
         self.target_y_step = int(self.declare_parameter('target_y_step', TARGET_Y_STEP).value)
         self.lane_width_for_center = int(
             self.declare_parameter('lane_width_for_center', LANE_WIDTH_FOR_CENTER).value)
+        self.lane_center_tilt_comp = float(
+            self.declare_parameter('lane_center_tilt_comp', LANE_CENTER_TILT_COMP).value)
+        self.lane_center_force_single_line = bool(
+            self.declare_parameter('lane_center_force_single_line', LANE_CENTER_FORCE_SINGLE_LINE).value)
 
         self.cv_bridge = CvBridge()
         self.qos_profile = qos_profile_sensor_data
         self.subscriber = self.create_subscription(DetectionArray, self.sub_topic, self.yolov8_detections_callback, self.qos_profile)
         self.obstacle_sub = self.create_subscription(Point32, self.sub_obstacle_topic, self.obstacle_callback, self.qos_profile)
+        self.obstacle_array_sub = self.create_subscription(
+            Polygon, self.sub_obstacle_array_topic, self.obstacle_array_callback, self.qos_profile)
         self.publisher = self.create_publisher(LaneInfo, self.pub_topic, 10)
         self.roi_image_publisher = self.create_publisher(Image, self.roi_image_topic, 10)
 
@@ -99,9 +122,15 @@ class Yolov8InfoExtractor(Node):
         self.current_lane_state = self.fixed_lane_class or 'lane_2'
         self.current_offset = 0.0
         self.target_offset = 0.0
+        # 지금 실제로 유지 중인 회피 오프셋(0.0 / ±lane_width_pixel). target_offset과 달리
+        # 매 프레임 리셋되지 않고, 아래 회피 판단부의 디바운싱 로직으로만 바뀐다.
+        self.active_avoidance_offset = 0.0
+        self.avoidance_release_counter = 0
         self.obstacle_detected = False
         self.obstacle_dist = 999.0
         self.obstacle_pixel_x = -1.0
+        # 검출된 장애물 전부: [(거리[m], 중심x[px], 반폭[px]), ...]
+        self.obstacles = []
 
         # 차선 상태 전환 디바운싱용
         self.lane_change_counter = 0
@@ -118,6 +147,11 @@ class Yolov8InfoExtractor(Node):
             self.obstacle_detected = False
             self.obstacle_dist = 999.0
             self.obstacle_pixel_x = -1.0
+
+    def obstacle_array_callback(self, msg: Polygon):
+        """검출된 장애물 전부. 각 점 = (x=거리[m], y=중심x[px], z=반폭[px])."""
+        self.obstacles = [(float(p.x), float(p.y), float(p.z)) for p in msg.points
+                          if float(p.x) >= 0.0 and float(p.y) >= 0.0]
 
     def yolov8_detections_callback(self, detection_msg: DetectionArray):
         if len(detection_msg.detections) == 0: return
@@ -178,51 +212,84 @@ class Yolov8InfoExtractor(Node):
         # ---------------------------------------------------
         # 2. [방식 B] BBox Overlap Check (겹침 확인)
         # ---------------------------------------------------
-        self.target_offset = 0.0
         tracking_class = self.current_lane_state
 
         # 장애물이 어디 있는지 동적으로 판단
         obstacle_in_lane_1 = False
         obstacle_in_lane_2 = False
 
-        if self.obstacle_detected:
-            # 1차선 박스 안에 장애물 중심(Pixel X)이 들어가는가?
-            if has_lane_1:
-                l1_min = lane_1_box.bbox.center.position.x - (lane_1_box.bbox.size.x / 2)
-                l1_max = lane_1_box.bbox.center.position.x + (lane_1_box.bbox.size.x / 2)
-                if l1_min < self.obstacle_pixel_x < l1_max:
-                    obstacle_in_lane_1 = True
+        # 회피 대상 거리 안에 있는 장애물 전부를 본다. 가장 가까운 하나만 보면
+        # 그걸 피해 지나가 박스가 사라지는 순간 판단에서 빠져, 옆 차선에 남아있는
+        # 장애물을 놓치고 그쪽으로 꺾어 들어간다.
+        nearby = [(cx, half_w) for dist, cx, half_w in self.obstacles
+                  if dist < self.avoidance_trigger_dist]
+        if not nearby and self.obstacle_detected and self.obstacle_dist < self.avoidance_trigger_dist:
+            # 배열 토픽이 안 오는 구성에서의 하위 호환
+            nearby = [(self.obstacle_pixel_x, 0.0)]
 
-            # 2차선 박스 안에 장애물 중심(Pixel X)이 들어가는가?
-            if has_lane_2:
-                l2_min = lane_2_box.bbox.center.position.x - (lane_2_box.bbox.size.x / 2)
-                l2_max = lane_2_box.bbox.center.position.x + (lane_2_box.bbox.size.x / 2)
-                if l2_min < self.obstacle_pixel_x < l2_max:
-                    obstacle_in_lane_2 = True
+        if has_lane_1:
+            l1_min = lane_1_box.bbox.center.position.x - (lane_1_box.bbox.size.x / 2)
+            l1_max = lane_1_box.bbox.center.position.x + (lane_1_box.bbox.size.x / 2)
+        if has_lane_2:
+            l2_min = lane_2_box.bbox.center.position.x - (lane_2_box.bbox.size.x / 2)
+            l2_max = lane_2_box.bbox.center.position.x + (lane_2_box.bbox.size.x / 2)
+
+        for obs_cx, obs_half_w in nearby:
+            # 박스 반폭만큼 넓혀서 겹침을 본다 (중심점만 보면 큰 장애물을 흘린다)
+            o_min = obs_cx - obs_half_w
+            o_max = obs_cx + obs_half_w
+
+            if has_lane_1 and o_min < l1_max and o_max > l1_min:
+                obstacle_in_lane_1 = True
+            if has_lane_2 and o_min < l2_max and o_max > l2_min:
+                obstacle_in_lane_2 = True
 
             # (만약 박스가 안 잡혔다면 픽셀 기준으로 대체)
             if not has_lane_1 and not has_lane_2:
-                if self.obstacle_pixel_x < self.image_center_x: obstacle_in_lane_1 = True
+                if obs_cx < self.image_center_x: obstacle_in_lane_1 = True
                 else: obstacle_in_lane_2 = True
 
-        # 전략 수립
-        if self.obstacle_detected and self.obstacle_dist < self.avoidance_trigger_dist:
-            if self.current_lane_state == 'lane_2':
-                # 내가 2차선인데 2차선에 장애물이 '확실히' 있다 -> 피함
+        # 전략 수립 — 트리거는 즉시, 해제는 디바운싱.
+        #
+        # 예전엔 target_offset을 매 프레임 0.0으로 리셋한 뒤, 이번 프레임에 겹침이 다시
+        # 확인돼야만 회피값을 세팅했다. 그러면 "장애물 인식이 끊김"과 "장애물이 실제로
+        # 지나감"을 코드가 구분하지 못한다. 특히 장애물에 가까워질수록 YOLO 박스가
+        # 안정적으로 안 잡히는 경우가 흔한데, 하필 가장 위험한 근접 구간에서 인식이
+        # 끊기면 그 순간 회피가 풀려 원래 차선(장애물이 있는 쪽)으로 복귀하려다
+        # 그대로 장애물을 들이받았다.
+        #
+        # 그래서 지속 상태(active_avoidance_offset)를 따로 두고 세 가지를 구분한다:
+        #   1) 확실히 막혀 있음(obstacle_in_lane_X) -> 즉시 회피, 해제 카운터 리셋
+        #   2) 검출은 됐는데 확실히 안 겹침(지나감) -> 해제 카운터 증가, 임계값 도달 시만 복귀
+        #   3) 아예 미검출(정보 없음) -> 카운터를 건드리지 않고 지금 상태 그대로 유지(보류).
+        #      "모른다"를 "괜찮다"로 착각하지 않는다.
+        if self.current_lane_state == 'lane_2':
+            if self.obstacle_detected and self.obstacle_dist < self.avoidance_trigger_dist:
                 if obstacle_in_lane_2:
-                    self.target_offset = -self.lane_width_pixel
+                    self.active_avoidance_offset = -self.lane_width_pixel
+                    self.avoidance_release_counter = 0
                     self.get_logger().warn(f"🚧 Obs Inside Lane 2 Box -> Dodge LEFT")
-                else:
-                    # 1차선에만 있거나 어디에도 안 겹침 -> 직진
-                    self.target_offset = 0.0
+                elif self.active_avoidance_offset != 0.0:
+                    self.avoidance_release_counter += 1
+                    if self.avoidance_release_counter >= self.avoidance_release_threshold_count:
+                        self.active_avoidance_offset = 0.0
+                        self.avoidance_release_counter = 0
+            # else: 미검출 -> 아무것도 안 함 (active_avoidance_offset/counter 유지)
 
-            elif self.current_lane_state == 'lane_1':
-                # 내가 1차선인데 1차선에 장애물이 '확실히' 있다 -> 피함
+        elif self.current_lane_state == 'lane_1':
+            if self.obstacle_detected and self.obstacle_dist < self.avoidance_trigger_dist:
                 if obstacle_in_lane_1:
-                    self.target_offset = self.lane_width_pixel
+                    self.active_avoidance_offset = self.lane_width_pixel
+                    self.avoidance_release_counter = 0
                     self.get_logger().warn(f"🚧 Obs Inside Lane 1 Box -> Dodge RIGHT")
-                else:
-                    self.target_offset = 0.0
+                elif self.active_avoidance_offset != 0.0:
+                    self.avoidance_release_counter += 1
+                    if self.avoidance_release_counter >= self.avoidance_release_threshold_count:
+                        self.active_avoidance_offset = 0.0
+                        self.avoidance_release_counter = 0
+            # else: 미검출 -> 아무것도 안 함 (active_avoidance_offset/counter 유지)
+
+        self.target_offset = self.active_avoidance_offset
 
         # 추종할 차선 마스크가 안 보이면 반대쪽 차선을 대신 추종하고 오프셋으로 보정
         final_tracking_class = tracking_class
@@ -279,7 +346,9 @@ class Yolov8InfoExtractor(Node):
                                                   detection_thickness=10, road_gradient=grad,
                                                   lane_width=self.lane_width_for_center,
                                                   line_side=('left' if final_tracking_class == 'lane_1'
-                                                             else 'right'))
+                                                             else 'right'),
+                                                  tilt_comp=self.lane_center_tilt_comp,
+                                                  force_single_line=self.lane_center_force_single_line)
             if target_point_x != -1:
                 final_x = target_point_x + self.current_offset
                 final_x = max(0, min(640, final_x))

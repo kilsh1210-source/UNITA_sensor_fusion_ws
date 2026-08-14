@@ -1,13 +1,69 @@
 import os
+import signal
+import subprocess
+import time
 
 import yaml
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+
+def _kill_stale_launch(context, *args, **kwargs):
+    """이전에 떠 있는 ros2 launch가 아직 안 죽었으면 정리하고 기다린다.
+
+    rplidar_node가 "이전 launch가 완전히 안 죽은 채로 새 launch가 /dev/ttyUSB0를
+    열려다 실패해서 그 자리에서 죽는" 문제(SDK 에러 0x80008004)가 반복됐다.
+    stop_drive.sh(워크스페이스 루트)와 같은 로직을 launch 시작 시점에 자동으로
+    돌려서, 매번 수동으로 먼저 실행 안 해도 되게 한다.
+
+    OpaqueFunction으로 등록한 이유: `ros2 launch ... --show-args`처럼 실제로
+    노드를 띄우지 않고 launch 파일만 정적으로 읽는 경우에도 generate_launch_description()
+    자체는 호출된다. 이 로직을 함수 본문에 그냥 두면 그때도 실행돼 버리므로,
+    LaunchService가 실제로 실행할 때만 도는 OpaqueFunction으로 감쌌다.
+    """
+    my_pid = os.getpid()
+
+    def _running_launch_pids():
+        try:
+            out = subprocess.run(['pgrep', '-f', 'ros2 launch'],
+                                  capture_output=True, text=True).stdout
+        except FileNotFoundError:
+            return []
+        return [int(p) for p in out.split() if p.strip() and int(p) != my_pid]
+
+    pids = _running_launch_pids()
+    if not pids:
+        return []
+
+    print(f"[full_bringup] 이전 ros2 launch 발견(PID {pids}) -> 정리 후 시작합니다.")
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+
+    # YOLO 등 GPU 노드 정리 시간을 고려해 최대 15초 대기
+    for i in range(15):
+        time.sleep(1)
+        if not _running_launch_pids():
+            print(f"[full_bringup] 이전 launch 정상 종료 확인 ({i + 1}s)")
+            return []
+
+    remaining = _running_launch_pids()
+    if remaining:
+        print(f"[full_bringup] 15초 지나도 안 죽어서 강제종료(SIGKILL): {remaining}")
+        for pid in remaining:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        time.sleep(1)
+    return []
 
 
 def generate_launch_description():
@@ -90,6 +146,9 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        # 다른 노드가 뜨기 전에 먼저 실행돼야 하므로 리스트 맨 앞.
+        OpaqueFunction(function=_kill_stale_launch),
+
         DeclareLaunchArgument('serial_port', default_value=serial_port,
                                description='RPLIDAR USB serial port'),
         DeclareLaunchArgument('serial_baudrate', default_value=serial_baudrate,

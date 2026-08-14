@@ -3,6 +3,12 @@ import numpy as np
 import sys
 import os
 from typing import Tuple
+import rclpy.logging as _rclpy_logging
+
+# [곡선 인코스 진단용 임시 로그] get_lane_center()가 '두 선 보임' 분기로 새면
+# tilt_comp가 아예 적용되지 않는다. 실주행에서 어느 분기가 도는지 확인하려고 넣었다.
+# 확인 끝나면 이 카운터/로그 블록은 지운다.
+_debug_call_counter = 0
 
 message = """
 
@@ -172,7 +178,7 @@ def edge_image_postproc(cv_image: np.array, show_image=True):
 
 	return roi_img
 
-def get_lane_center(cv_image: np.array, detection_height: int, detection_thickness: int, road_gradient: float, lane_width: int, line_side: str = None) -> int:
+def get_lane_center(cv_image: np.array, detection_height: int, detection_thickness: int, road_gradient: float, lane_width: int, line_side: str = None, tilt_comp: float = 0.0, force_single_line: bool = False) -> int:
 	"""BEV ROI에서 차선 중심 x를 추정한다. 실패하면 -1.
 
 	line_side: 지금 보고 있는 선이 차선의 어느 쪽인지. 'left' | 'right' | None.
@@ -180,6 +186,15 @@ def get_lane_center(cv_image: np.array, detection_height: int, detection_thickne
 	  road_gradient 부호로 추측하는데, 곡선이나 노이즈에서 부호가 뒤집히면
 	  추정 중심이 차선 폭만큼 통째로 반대편으로 튄다. 호출측이 추종 중인
 	  클래스(lane_1=좌측선, lane_2=우측선)를 알고 있으므로 넘겨주는 편이 확실하다.
+
+	tilt_comp: 차선 기울기(cos) 보정 강도. 0.0=보정 없음(예전 동작), 1.0=완전 보정.
+	  아래 '한쪽 선만 보인 경우' 주석 참고. 보정 배율은 2.0배로 제한된다.
+
+	force_single_line: '두 선이 보인다' 분기를 막을지 여부. 기본값 False=예전 동작.
+	  아래 주석 참고. 켜면 lane_width를 반드시 다시 재야 한다.
+
+	tilt_comp / force_single_line 둘 다 기본값이 '예전 동작'이다.
+	타겟 위치를 바꾸는 변경이라, lane_width는 이 둘이 꺼진 상태에서 역산된 값이기 때문이다.
 	"""
 	detection_area_upper_bound = detection_height - int(detection_thickness/2)
 	detection_area_lower_bound = detection_height + int(detection_thickness/2)
@@ -203,7 +218,19 @@ def get_lane_center(cv_image: np.array, detection_height: int, detection_thickne
 	left_val = cut_outliers_array[max_diff_idx_left]
 	right_val = cut_outliers_array[max_diff_idx_right]
 
-	if abs(left_val - right_val) < (lane_width/3):
+	# force_single_line: '두 선이 보인다' 분기를 아예 막을지 여부. 기본값 False = 예전 동작.
+	#
+	# draw_edges()가 추종 클래스 하나만 그리므로 이 함수가 보는 선은 원리상 항상 1개다.
+	# 그런데 마스크가 기울거나 조각나면 같은 선의 픽셀이 lane_width/3(=72px) 넘게 벌어져
+	# 아래 else로 빠지고, '그 선의 중앙'을 차선 중심으로 반환한다
+	# (= 타겟이 폭의 절반인 108px만큼 통째로 이동).
+	#
+	# 원리만 보면 항상 막는 게 맞지만, 그러면 안 된다.
+	# lane_width_for_center(216)는 이 두 분기가 섞인 상태에서 주행 184프레임으로 역산한
+	# 값이라, 분기 동작을 바꾸면 그 캘리브레이션이 통째로 무효가 된다.
+	# 실제로 이걸 무조건 막았더니 타겟이 108px 밀려 차가 중심으로 복귀하지 못했다.
+	# 켜려면 lane_width_for_center를 반드시 다시 재야 한다(README 10번).
+	if force_single_line or abs(left_val - right_val) < (lane_width/3):
 		line_x_axis_pixel = cut_outliers_array[round((cut_outliers_array.shape[0])/2)]
 		center_pixel = None
 	else:
@@ -216,16 +243,45 @@ def get_lane_center(cv_image: np.array, detection_height: int, detection_thickne
 	elif line_x_axis_pixel is not None:
 		# 한쪽 선만 보인 경우: 차선 폭의 절반만큼 밀어서 중심을 추정.
 		# 좌측선을 보고 있으면 중심은 그 오른쪽, 우측선이면 그 왼쪽에 있다.
+		#
+		# 밀어야 할 방향은 '차선에 수직'인데, 우리는 같은 행(가로)에서 민다.
+		# 차선이 수직에서 theta만큼 기울어져 있으면 같은 행에서의 가로 거리는
+		# (lane_width/2)/cos(theta)다. cos 보정을 빼면 곡선에서 항상 부족하게 밀려
+		# 추정 중심이 '지금 보고 있는 선' 쪽으로 끌려간다.
+		#   theta=30도 -> 17px, 40도 -> 33px, 50도 -> 60px 부족
+		#   theta=60도 -> 108px 부족 = 폭의 절반, 즉 타겟이 선 위에 정확히 얹힌다
+		# lane_2(우측선)를 추종하는 우회전 구간에서는 그 선이 곧 인코스라
+		# "곡선에서 인코스 선을 밟고 주행"으로 나타났다.
+		#
+		# theta는 dominant_gradient()가 이미 구해서 넘겨준 값(도 단위, 수직 기준)이다.
+		# 90도 근처에서 발산하므로 배율을 2.0배로 제한한다.
+		# 검출 실패 시 dominant_gradient()는 0.0을 주므로 보정 없음(기존 동작)이 된다.
+		#
+		# 한계: theta는 ROI 전체에 대한 Hough 각도의 중앙값이라 모든 행에 같은 값을 쓴다.
+		# 실제로는 곡선에서 가까운 행일수록 덜 기울어져 있어, 근거리는 과보정,
+		# 원거리는 부족 보정이 된다. 행별 기울기를 쓰려면 각 행에서 다시 재야 한다.
+		tilt_scale = 1.0 / max(np.cos(np.deg2rad(float(road_gradient))), 1e-3)
+		tilt_scale = 1.0 + float(tilt_comp) * (tilt_scale - 1.0)
+		half_width = (lane_width / 2.0) * min(max(tilt_scale, 1.0), 2.0)
+
 		if line_side == 'left':
-			road_target_point_x = line_x_axis_pixel + (lane_width/2)
+			road_target_point_x = line_x_axis_pixel + half_width
 		elif line_side == 'right':
-			road_target_point_x = line_x_axis_pixel - (lane_width/2)
+			road_target_point_x = line_x_axis_pixel - half_width
 		elif road_gradient > 0:
-			road_target_point_x = line_x_axis_pixel + (lane_width/2)
+			road_target_point_x = line_x_axis_pixel + half_width
 		else:
-			road_target_point_x = line_x_axis_pixel - (lane_width/2)
+			road_target_point_x = line_x_axis_pixel - half_width
 	else:
 		return -1
+
+	global _debug_call_counter
+	_debug_call_counter += 1
+	if _debug_call_counter % 15 == 0:
+		branch = 'TWO_LINE(tilt_comp 미적용!)' if center_pixel is not None else 'single_line(tilt_comp 적용)'
+		_rclpy_logging.get_logger('lane_center_debug').info(
+			f"[진단] row={detection_height} branch={branch} gap={abs(int(left_val)-int(right_val))}px "
+			f"theta={float(road_gradient):.1f} raw_target_x={road_target_point_x:.0f}")
 
 	# 영상 폭으로 clamp한다. 예전에는 lane_width(차선 폭, 기본 300)로 잘랐는데,
 	# 차선 폭을 영상 폭인 양 쓴 것이라 640폭 영상에서 타겟이 항상 299 이하로

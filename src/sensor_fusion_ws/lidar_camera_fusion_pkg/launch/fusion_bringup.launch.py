@@ -2,7 +2,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, TimerAction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -151,7 +151,13 @@ def generate_launch_description():
             description="bird_eye_node(보기용 차선 BEV) 실행 여부. 주행 중에는 "
                         'yolov8_node가 이미 lane_seg를 돌리므로 false를 권장'),
 
-        # LiDAR
+        # LiDAR — 다른 노드보다 먼저, 단독으로 띄운다.
+        #
+        # rplidar_node가 카메라/YOLO와 동시에 뜨면 그 순간 CPU/USB가 몰려서
+        # (YOLO 모델 로딩 + 카메라 캡처 초기화) 라이다의 시리얼 핸드셰이크가 실패하는
+        # 경우가 잦았다(SDK 에러 0x80008004). 단독으로 먼저 띄웠을 땐 매번 성공했다.
+        # 그래서 라이다를 먼저 띄우고, 아래 카메라/YOLO 계열은 몇 초 늦게 띄워서
+        # 핸드셰이크가 끝날 시간을 확보한다.
         Node(
             package='rplidar_ros',
             executable='rplidar_node',
@@ -168,69 +174,72 @@ def generate_launch_description():
             }],
         ),
 
-        # Camera
-        # (해상도 / 오토포커스 / 자동노출 등 나머지 설정은 params.yaml에서 들어옴)
-        Node(
-            package='camera_perception_pkg',
-            executable='image_publisher_node',
-            name='image_publisher_node',
-            output='screen',
-            parameters=base + [{
-                'cam_num': cam_num,
-                'logger': False,
-            }],
-        ),
+        # 카메라/YOLO/버드아이뷰/퓨전 — 라이다 핸드셰이크가 끝날 시간을 주기 위해 지연 시작.
+        TimerAction(period=3.0, actions=[
+            # Camera
+            # (해상도 / 오토포커스 / 자동노출 등 나머지 설정은 params.yaml에서 들어옴)
+            Node(
+                package='camera_perception_pkg',
+                executable='image_publisher_node',
+                name='image_publisher_node',
+                output='screen',
+                parameters=base + [{
+                    'cam_num': cam_num,
+                    'logger': False,
+                }],
+            ),
 
-        # YOLO detection
-        # (threshold / 오탐 억제 필터는 params.yaml에서 들어옴)
-        Node(
-            package='camera_perception_pkg',
-            executable='yolov8_node',
-            name='yolov8_node',
-            output='screen',
-            parameters=base + [{
-                'model': model_path,
-                'device': device,
-            }],
-        ),
+            # YOLO detection
+            # (threshold / 오탐 억제 필터는 params.yaml에서 들어옴)
+            Node(
+                package='camera_perception_pkg',
+                executable='yolov8_node',
+                name='yolov8_node',
+                output='screen',
+                parameters=base + [{
+                    'model': model_path,
+                    'device': device,
+                }],
+            ),
 
-        # Bird's-eye lane view: bird_eye/image(버드아이뷰)는 Fusion Visualizer 4번,
-        # bird_eye/roi(ROI 표시된 원본)는 5번 화면으로 각각 전달됨.
-        # 자체 미리보기 창은 중복이라 꺼둠 (show_preview).
-        Node(
-            package='camera_perception_pkg',
-            executable='bird_eye_node',
-            name='bird_eye_node',
-            output='screen',
-            condition=IfCondition(enable_bird_eye),
-            parameters=base + [{
-                # 퓨전(image_fusion_node)이 쓰는 카메라와 같은 토픽을 본다
-                'input_topic': 'image_raw',
-                'device': device,
-                'show_preview': bird_eye_preview,
-            }],
-        ),
+            # Bird's-eye lane view: bird_eye/image(버드아이뷰)는 Fusion Visualizer 4번,
+            # bird_eye/roi(ROI 표시된 원본)는 5번 화면으로 각각 전달됨.
+            # 자체 미리보기 창은 중복이라 꺼둠 (show_preview).
+            Node(
+                package='camera_perception_pkg',
+                executable='bird_eye_node',
+                name='bird_eye_node',
+                output='screen',
+                condition=IfCondition(enable_bird_eye),
+                parameters=base + [{
+                    # 퓨전(image_fusion_node)이 쓰는 카메라와 같은 토픽을 본다
+                    'input_topic': 'image_raw',
+                    'device': device,
+                    'show_preview': bird_eye_preview,
+                }],
+            ),
 
-        # LiDAR-Camera fusion (distance overlay)
-        Node(
-            package='lidar_camera_fusion_pkg',
-            executable='image_fusion_node',
-            name='image_fusion_node',
-            output='screen',
-            # fy/cy와 calib_* 미세보정 값은 params.yaml에서 들어옴
-            # (예전에는 fx/cx만 여기서 넘기고 fy/cy는 소스 하드코딩 기본값이 조용히 쓰였다)
-            parameters=base + [{
-                'fx': fx,
-                'cx': cx,
-                'front_angle_deg': lidar_front_offset_deg,
-                'display_mode': display_mode,
-                'draw_all_points': draw_all_points,
-                'distance_tolerance': distance_tolerance,
-                'use_urdf_extrinsic': use_urdf_extrinsic,
-                'lidar_frame_id': lidar_frame_id,
-                'camera_frame_id': camera_frame_id,
-                'display': True,
-                'publish_annotated': False,
-            }],
-        ),
+            # LiDAR-Camera fusion (distance overlay)
+            Node(
+                package='lidar_camera_fusion_pkg',
+                executable='image_fusion_node',
+                name='image_fusion_node',
+                output='screen',
+                # fy/cy와 calib_* 미세보정 값은 params.yaml에서 들어옴
+                # (예전에는 fx/cx만 여기서 넘기고 fy/cy는 소스 하드코딩 기본값이 조용히 쓰였다)
+                parameters=base + [{
+                    'fx': fx,
+                    'cx': cx,
+                    'front_angle_deg': lidar_front_offset_deg,
+                    'display_mode': display_mode,
+                    'draw_all_points': draw_all_points,
+                    'distance_tolerance': distance_tolerance,
+                    'use_urdf_extrinsic': use_urdf_extrinsic,
+                    'lidar_frame_id': lidar_frame_id,
+                    'camera_frame_id': camera_frame_id,
+                    'display': True,
+                    'publish_annotated': False,
+                }],
+            ),
+        ]),
     ])

@@ -42,6 +42,16 @@ KD = 0.045                                             # 변화량 이득(진동
 MAX_PD_STEER = 4.0                                    # PD 보정 최대 절대값
 LOOKAHEAD_Y = 155                                     # PD가 참조할 y 라인(화면 아래쪽일수록 가까움)
 
+# Steering smoothing
+# 조향 명령은 MotionCommand.steering(int32)으로 나가면서 round()되고, serial_sender가
+# max_steer_cmd로 나눠 -1.0~1.0으로 정규화한다. 즉 명령 1칸 = 전체 조향각의 1/max_steer_cmd.
+# max_steer_cmd=9면 한 칸이 조향 포텐셔미터로 약 8(좌)~12(우) counts인데, 펌웨어의
+# STEERING_DEADBAND가 6이라 한 칸만 바뀌어도 조향 모터가 켜졌다 꺼진다. 저속에서 같은
+# 곡률을 도는 데 제어 틱이 더 많이 들어가면 이 계단이 하나씩 다 느껴진다(틱틱거림).
+# 아래 두 값이 한 번의 큰 변화를 여러 틱에 나눠 내보내 그 충격을 줄인다.
+STEER_SMOOTHING_ALPHA = 0.4                           # 1.0이면 스무딩 없음(원본 동작). 작을수록 부드럽고 반응이 느려짐
+STEER_RATE_LIMIT = 3.0                                # 제어 틱당 허용 변화량(steer_cmd 단위). 0 이하면 제한 없음
+
 # Speed
 BASE_SPEED = 200                                      # 기본 주행 속도
 MIN_SPEED = 100                                      # 최소 속도 하한
@@ -103,6 +113,18 @@ class UnitaPurePursuitNode(Node):
         self.lookahead_y = int(self.declare_parameter("lookahead_y", LOOKAHEAD_Y).value)
 
         self.max_steer = float(self.declare_parameter("max_steer", MAX_PD_STEER).value)
+
+        # -------------------------
+        # Steering smoothing
+        # -------------------------
+        self.steer_smoothing_alpha = float(
+            self.declare_parameter("steer_smoothing_alpha", STEER_SMOOTHING_ALPHA).value
+        )
+        self.steer_rate_limit = float(self.declare_parameter("steer_rate_limit", STEER_RATE_LIMIT).value)
+        # 필터 상태는 반드시 round() 전의 float으로 들고 있어야 한다.
+        # 반올림된 값을 되먹이면 필터가 정수 격자에 갇혀 목표에 영영 못 닿는다.
+        self.steer_state = 0.0
+
         self.base_speed = int(self.declare_parameter("base_speed", BASE_SPEED).value)
         self.min_speed = int(self.declare_parameter("min_speed", MIN_SPEED).value)
         self.max_speed = int(self.declare_parameter("max_speed", MAX_SPEED).value)
@@ -166,12 +188,19 @@ class UnitaPurePursuitNode(Node):
         if not forward_points:
             forward_points = path
 
-        for p in forward_points:
+        # 경로는 y 오름차순, 즉 "먼 쪽 -> 가까운 쪽" 순으로 들어온다.
+        # 순수 추종은 차량에서 lookahead_distance 이상 떨어진 '첫' 점을 봐야 하므로
+        # 가까운 쪽부터 훑어야 한다. 먼 쪽부터 훑으면 최원점이 언제나 조건을 만족해
+        # lookahead_distance 값과 무관하게 그 한 점만 선택된다(경로 최대 길이는
+        # 차량 y=179, 최원점 y=5로 174px라 어떤 설정값이든 첫 검사에서 통과).
+        # 그 결과 곡선에서 중간 형상을 못 읽고 최원점을 직선으로 겨냥해 안쪽을 가로질렀다.
+        for p in reversed(forward_points):
             dx = p[0] - car_x
             dy = p[1] - car_y
             if math.hypot(dx, dy) >= self.lookahead_distance:
                 return p
 
+        # 경로가 lookahead_distance보다 짧으면 가장 먼 점으로 대체
         return forward_points[0] if forward_points else None
 
     def compute_pp_steer_cmd(self, path):
@@ -187,12 +216,20 @@ class UnitaPurePursuitNode(Node):
         car_x, car_y = self.car_center_point
         lx, ly = lookahead
 
+        # 분모는 파라미터가 아니라 '실제로 고른 점까지의 거리'여야 한다.
+        # 선택이 정상이면 둘이 거의 같지만, 경로가 lookahead_distance보다 짧아
+        # 더 먼 점으로 대체된 경우 파라미터를 쓰면 그 비율만큼 조향이 과해진다.
+        # (예전: 실거리 174px인데 분모에 120을 써서 1.45배 과조향)
+        lookahead_dist = math.hypot(lx - car_x, ly - car_y)
+        if lookahead_dist < 1e-6:
+            return 0.0
+
         target_angle = math.atan2(ly - car_y, lx - car_x)
         alpha = normalize_angle(target_angle - self.vehicle_heading)
 
         steer_angle = math.atan2(
             2.0 * self.wheelbase * math.sin(alpha),
-            self.lookahead_distance,
+            lookahead_dist,
         )
 
         steer_cmd = (steer_angle / self.max_steer_angle) * self.max_steer_cmd
@@ -212,6 +249,37 @@ class UnitaPurePursuitNode(Node):
 
         steer = clamp(steer, -self.max_steer, self.max_steer)
         return float(steer)
+
+    def smooth_steer(self, steer_cmd):
+        """조향 명령을 EMA + 레이트리밋으로 완만하게 만든다.
+
+        EMA가 큰 변화를 지수적으로 나눠 내보내고, 레이트리밋이 그 첫 틱의 크기에
+        상한을 건다. 둘 다 self.steer_state(float)를 기준으로 계산한다.
+
+        주의: 입력이 ±max_steer_cmd를 매 틱 오가는 극단적 진동이면 레이트리밋이 계속
+        걸리면서 출력 평균이 0이 아닌 쪽으로 치우친다(±9 입력 -> 0~3 왕복). 그 정도로
+        떨고 있으면 스무딩이 아니라 상류(경로/PD)를 봐야 한다. 실제 진폭인 ±2~4에서는
+        레이트리밋이 걸리지 않아 대칭이다.
+        """
+        target = float(steer_cmd)
+
+        if 0.0 < self.steer_smoothing_alpha < 1.0:
+            target = (self.steer_smoothing_alpha * target
+                      + (1.0 - self.steer_smoothing_alpha) * self.steer_state)
+
+        if self.steer_rate_limit > 0.0:
+            delta = clamp(target - self.steer_state, -self.steer_rate_limit, self.steer_rate_limit)
+            target = self.steer_state + delta
+
+        self.steer_state = clamp(target, -self.max_steer_cmd, self.max_steer_cmd)
+        return self.steer_state
+
+    def publish_stop(self):
+        """정지 명령. 조향도 0으로 나가므로(펌웨어가 rear_pwm과 무관하게 targetSteering을
+        갱신함) 필터 상태도 0으로 맞춰야 다음 출발 때 옛날 값에서 이어지지 않는다."""
+        self.steer_state = 0.0
+        self.prev_dx = 0.0
+        self.publish_cmd(0.0, 0, 0)
 
     def should_stop_by_traffic(self):
         if self.traffic_light_data is None:
@@ -234,15 +302,15 @@ class UnitaPurePursuitNode(Node):
     # -------------------------
     def timer_callback(self):
         if not self.path_data:
-            self.publish_cmd(0.0, 0, 0)
+            self.publish_stop()
             return
 
         if self.use_traffic_lidar_stop:
             if self.lidar_data is not None and self.lidar_data.data is True:
-                self.publish_cmd(0.0, 0, 0)
+                self.publish_stop()
                 return
             if self.should_stop_by_traffic():
-                self.publish_cmd(0.0, 0, 0)
+                self.publish_stop()
                 return
 
         steer_pp = self.compute_pp_steer_cmd(self.path_data)
@@ -253,6 +321,7 @@ class UnitaPurePursuitNode(Node):
 
         steer_cmd = steer_pp + steer_pd
         steer_cmd = clamp(steer_cmd, -self.max_steer_cmd, self.max_steer_cmd)
+        steer_cmd = self.smooth_steer(steer_cmd)
 
         speed = int(self.base_speed - self.steer_speed_gain * abs(steer_cmd))
         speed = int(clamp(speed, self.min_speed, self.max_speed))

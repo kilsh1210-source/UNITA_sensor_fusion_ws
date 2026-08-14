@@ -41,7 +41,9 @@ def generate_launch_description():
     # (ros2 topic echo /topic_control_signal) 바퀴를 안 굴리고 조향/속도를 확인할 수 있다.
     enable_serial = LaunchConfiguration('enable_serial', default='true')
     # 판단 노드들을 센서/YOLO가 뜬 뒤에 올리기 위한 지연[s]
-    decision_start_delay = LaunchConfiguration('decision_start_delay', default='5.0')
+    # fusion_bringup.launch.py가 라이다 핸드셰이크 시간 확보를 위해 카메라/YOLO를
+    # 3초 늦게 띄우도록 바뀌어서, 그만큼 5.0 -> 8.0으로 같이 늦췄다.
+    decision_start_delay = LaunchConfiguration('decision_start_delay', default='8.0')
 
     # 버드아이뷰(bird_eye_node) - 퓨전과 같은 카메라(/image_raw)를 보고 차선을 그린다.
     # 결과는 Fusion Visualizer의 4(bev)/5(bev_roi) 화면으로 들어간다.

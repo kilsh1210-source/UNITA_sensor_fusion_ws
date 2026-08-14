@@ -8,7 +8,7 @@ lattice 경로계획 + pure pursuit으로 조향을 만들어 아두이노로 �
 ```
 카메라 ─ yolov8_node ─┬─ lane_info_extractor_node ─┐
                       │   (차선 마스크 → 목표점)     │
-                      └─ image_fusion_node ────────┤   (장애물 거리/픽셀x)
+                      └─ image_fusion_node ────────┤   (장애물 거리/픽셀x, 검출 전부 배열로도)
 라이다 ───────────────────────────────────────────┤
                                                    ▼
                           path_planner_node (lattice 경로)
@@ -114,7 +114,7 @@ ROS2 Humble이 설치되어 있어야 한다 (`/opt/ros/humble`).
 ## 2. 빌드
 
 ```bash
-cd ~/sensor_fusion_ws
+cd ~/UNITA_sensor_fusion_ws
 source /opt/ros/humble/setup.bash
 colcon build --symlink-install
 source install/setup.bash
@@ -212,6 +212,7 @@ ros2 launch sensor_fusion_bringup full_bringup.launch.py serial_port:=/dev/ttyUS
 카메라 → yolov8_node (cone / car_back / lane_seg) → /detections
    ├→ lane_info_extractor_node → /yolov8_lane_info      (BEV로 편 차선의 중심점들)
    └→ image_fusion_node        → /lidar_obstacle_info   (가장 가까운 장애물 거리[m] + 화면상 x[px])
+                                → /lidar_obstacle_array  (검출된 장애물 전부: 거리/중심x/반폭)
         → path_planner_node (lattice)      → /path_planning_result
         → motion_planner_node (pure pursuit + PD) → /topic_control_signal  (MotionCommand)
         → serial_sender_node → 아두이노 시리얼 "C,<조향 -1.0~1.0>,<후륜 PWM>"
@@ -223,6 +224,16 @@ ros2 launch sensor_fusion_bringup drive.launch.py enable_serial:=false
 
 # 실제 주행 (차를 들어올리거나 넓은 곳에서, 전원 차단 준비하고)
 ros2 launch sensor_fusion_bringup drive.launch.py cam_num:=2 serial_port:=/dev/ttyUSB1
+```
+
+**재launch하기 전에는 항상 `./stop_drive.sh`부터 실행할 것.** Ctrl+C 후 셸 프롬프트가 돌아오기
+전에(=이전 launch 프로세스 트리가 아직 안 죽었는데) 재launch하면, `rplidar_node`가
+`/dev/ttyUSB0`를 못 열어 그 자리에서 죽는다(SDK 에러 `0x80008004`, 라이다 자체 고장 아님 —
+포트 경합). `stop_drive.sh`는 이전 launch를 정상 종료(최대 15초 대기, 안 죽으면 강제종료)까지
+확인하고 라이다 포트가 비었는지까지 찍어준다.
+
+```bash
+./stop_drive.sh && ros2 launch sensor_fusion_bringup drive.launch.py ...
 ```
 
 `full_bringup.launch.py`의 인자(`cam_num`, `serial_port`, `device` …)는 여기서도 그대로 먹는다.
@@ -237,7 +248,11 @@ ros2 launch sensor_fusion_bringup drive.launch.py cam_num:=2 serial_port:=/dev/t
 [`config/params.yaml`](src/sensor_fusion_ws/sensor_fusion_bringup/config/params.yaml)의
 `lane_info_extractor_node` / `path_planner_node` / `motion_planner_node` / `serial_sender_node`
 항목에 모여 있다. 고친 뒤에는 `colcon build --packages-select sensor_fusion_bringup`을 다시 해야
-`install/`에 반영된다.
+`install/`에 반영된다. 단 `--symlink-install`로 빌드한 워크스페이스라면 `params.yaml`과 파이썬
+노드가 모두 `src/`로 심링크돼 있어 **재빌드 없이 launch만 다시 하면** 된다
+(확인: `ls -l install/sensor_fusion_bringup/share/sensor_fusion_bringup/config/params.yaml`).
+
+조향 이득·스무딩 파라미터와 튜닝 순서는 11번에 따로 정리돼 있다.
 
 ### 확인 순서
 
@@ -251,7 +266,9 @@ ros2 topic echo /topic_control_signal  # steering(-9~9), left_speed/right_speed
   `Lane Info (ROI)` 창에서 흰 선이 보이는지 확인하고, 안 보이면 `params.yaml`의 `src_points`(BEV 사다리꼴)를
   이 카메라 장착 각도에 맞게 다시 잡아야 한다.
 - `steering` 부호가 반대로 먹으면 `serial_sender_node`의 `steer_invert: true`.
-- 처음 굴릴 때는 `motion_planner_node`의 `base_speed`(기본 120)를 더 낮춰서 시작할 것.
+- 처음 굴릴 때는 `motion_planner_node`의 `base_speed`를 낮춰서 시작할 것(현재 33).
+  저속 튜닝 모드에서는 `base_speed`/`min_speed`/`max_speed`를 **같은 값으로 묶어야** 한다.
+  `base_speed`만 올리면 `clamp(base − gain×|steer|, min, max)`의 상한에 걸려 그대로 `max_speed`가 나간다.
   `max_steer_cmd`는 `motion_planner_node`와 `serial_sender_node` 양쪽이 같은 값이어야 한다.
 
 ## 4. 정상 동작 확인 (다른 터미널에서)
@@ -527,6 +544,7 @@ python3 firmware/tools/steer_pwm_sweep.py
 |---|---|---|
 | `fixed_lane_class` | `lane_2` | 추종 차선 고정. 빈 값이면 상태머신이 자동 판단 |
 | `lane_width_for_center` | 216 | BEV에서 가정하는 차선 폭(px) |
+| `lane_center_tilt_comp` | 1.0 | 차선 기울기(cos) 보정 강도. 0.0=꺼짐, 1.0=완전 보정 |
 | `car_center_x` | 332 | BEV ROI에서의 **차량 중심선**. 영상 정중앙(320)이 아니다 |
 | `target_y_end` | 95 | 목표점을 뽑을 행 범위 상한 (5/35/65 세 행만 사용) |
 
@@ -539,8 +557,91 @@ python3 firmware/tools/steer_pwm_sweep.py
 `중심 = 선위치 − 폭/2`이므로 **`폭 보정량 = 2 × 편차`**다. 조향이 한쪽으로 쏠려 있으면
 이 관계로 한 번에 맞출 수 있다.
 
+### 곡선에서의 기울기 보정 (`lane_center_tilt_comp`)
+
+`중심 = 선위치 ± 폭/2`의 이동을 **차선에 수직이 아니라 같은 행(가로)에서** 한다.
+차선이 수직에서 `theta`만큼 기울면 같은 행에서의 가로 거리는 `(폭/2)/cos(theta)`이므로,
+보정이 없으면 곡선에서 **항상 부족하게 밀린다**. 그만큼 추정 중심이 *지금 추종 중인 선* 쪽으로 끌려간다.
+
+| `theta` | 실제 필요한 가로 이동 | 보정 없을 때(108px) | 부족분 |
+|---|---|---|---|
+| 30° | 124.7px | 108px | 16.7px |
+| 40° | 141.0px | 108px | 33.0px |
+| 50° | 168.0px | 108px | 60.0px |
+| **60°** | **216.0px** | 108px | **108.0px** |
+
+60°에서 부족분이 정확히 폭의 절반이다. 즉 **타겟이 선 위에 그대로 얹힌다.**
+`lane_2`(우측선)를 추종하는 우회전 구간에서는 그 선이 곧 인코스라,
+"곡선에서 인코스 선을 밟고 주행"으로 나타났다.
+
+`theta`는 `dominant_gradient()`가 이미 구해 `get_lane_center()`에 넘겨주던 값인데
+그동안 부호 판정 폴백에만 쓰이고 보정에는 안 쓰였다. 현재 값은 아래로 확인한다.
+
+```bash
+ros2 topic echo /yolov8_lane_info --field slope   # 차선 기울기(도, 수직 기준)
+```
+
+보정량이 크므로(`theta`=49°면 타겟이 58px 이동) `0.5`에서 시작해 확인 후 `1.0`으로 올린다.
+보정 배율은 어떤 경우에도 **2.0배로 제한**된다(`theta`가 90°에 가까우면 발산하므로).
+
+> **[현재 상태]** `0.0`(진단용) → `0.5` 시운전을 거쳐 지금은 `lane_center_tilt_comp = 1.0`
+> (완전 보정)으로 적용해 둔 상태. 실주행으로 곡선 인코스가 줄어드는지 확인할 것. 이미 최댓값이라
+> 더 올릴 여지는 없고(보정 배율 2.0배 상한), 그래도 남으면 10번의 `path_planner_node` 진단이나
+> 11-5의 `lookahead_distance` 쪽을 봐야 한다.
+
+또한 `line_side`가 주어지면 `get_lane_center()`는 **항상 '선 1개' 경로**를 탄다.
+`draw_edges()`가 추종 클래스 하나만 그리므로 실제로 선은 항상 1개인데, 곡선에서 마스크가
+기울거나 조각나면 같은 선의 픽셀이 `lane_width/3`(=72px) 넘게 벌어져 '두 선이 보인다' 분기로
+새고, 그러면 **그 선의 중앙**을 차선 중심으로 반환해 타겟이 108px 통째로 튀었다.
+
+### 다중 장애물 회피 (`/lidar_obstacle_array`)
+
+`image_fusion_node`가 가장 가까운 장애물 1개(`/lidar_obstacle_info`)뿐 아니라 검출된 장애물
+전부를 `/lidar_obstacle_array`(Polygon, 점 하나 = `x`거리[m]/`y`중심x[px]/`z`반폭[px])로도 낸다.
+가장 가까운 것 하나만 보면, 그걸 피해 지나가는 순간 박스가 사라져 판단에서 빠지고 **다음
+장애물만 보고 꺾다가 직전 장애물을 들이받는다.** `lane_info_extractor_node`(차선 오프셋 판단)와
+`path_planner_node`(래티스 페널티) 둘 다 이 배열을 우선 쓰고, 안 오면 기존 단일 토픽으로
+대체한다(하위 호환).
+
+### 래티스 경로 비용 함수 — 곡선 인코스 원인과 수정 (`path_planner_node`)
+
+`select_best_candidate()`의 `lane_penalty`는 원래 아래처럼 계산됐다.
+
+```python
+lane_penalty = np.mean(np.abs(candidate_x - np.mean(candidate_x))) * lane_center_weight  # (수정 전)
+```
+
+이건 **후보 경로가 차선 중앙에서 얼마나 벗어났는지가 아니라, 후보 자기 자신의 평균에서 얼마나
+흩어졌는지(직선일수록 낮음)**를 재는 식이었다. 후보는 `x_points + linspace(0, offset, N)`이라
+오프셋(상수 성분)은 `candidate_x`의 평균을 그만큼 밀 뿐 산포도 자체는 거의 안 바꾸므로, 곡선
+구간에서는 **offset=0보다 경로를 펴 버리는 큰 오프셋 쪽이 오히려 비용이 낮게 나올 수 있었다**
+(실측: offset=0 비용 225 vs offset=+80 비용 42.5). `transition`의 최댓값이 차량 시작점 쪽에
+붙으므로 이 경우 차량 기준점 자체가 옆으로 밀리고, `motion_planner_node`의 PD가 보는
+`lookahead_y` 행에서도 dx가 커져 **좌/우 곡선 모두에서 안쪽으로 추가 조향**이 걸렸다.
+
+원인을 `path_change_cost`를 10.0으로 올려(오프셋 변경 자체를 억제) 격리 확인한 뒤, **수식을
+차선 중심(`x_points`)과의 편차로 고쳤다**:
+
+```python
+lane_penalty = np.mean(np.abs(candidate_x - x_points)) * lane_center_weight  # (수정 후)
+```
+
+이제 `offset=0`이면 `lane_penalty=0`이고 `|offset|`이 커질수록 정상적으로 커진다.
+`path_change_cost`는 진단용 10.0에서 지그재그 억제 목적의 원래 값 `0.05`로 되돌렸다.
+
+> **주의 (재검증 필요)**: `lane_center_weight`(10.0)는 이 버그가 있던 상태(오프셋과 거의
+> 무관하게 채점되던 상태)에서 정해진 값이다. 수식이 고쳐진 지금은 `|offset|`에 실제로
+> 비례해서 비용이 붙으므로, 장애물 회피(`obstacle_weight` 20 + `obstacle_penalty_gain` 3,
+> 최대 감점 약 200)보다 `lane_penalty`가 더 커지는 오프셋(대략 40px 이상)에서는 래티스가
+> 장애물을 피하는 쪽보다 차선 중앙 유지 쪽을 택할 수 있다. 다만 1차 회피는
+> `lane_info_extractor_node`가 목표점 자체를 `lane_width_pixel`(280px)만큼 미리 옮겨주는
+> 방식이라 이 영향을 크게 받지 않는다. 그래도 **장애물 회피 동작은 이 변경 이후 반드시
+> 실측으로 재확인할 것.**
+
 ### 알려진 한계
 
+- **기울기가 행별이 아님.** `theta`는 ROI 전체 Hough 각도의 중앙값이라 모든 행에 같은 값을
+  쓴다. 곡선에서 가까운 행은 덜 기울어져 있으므로 근거리는 과보정, 원거리는 부족 보정이 된다.
 - **행별 폭 미보정.** BEV는 원근 보정이라 실제 차선 폭이 행마다 다르다(근거리 ~125,
   원거리 ~222). 지금은 모든 행에 같은 `lane_width_for_center`를 써서, 차량에 가까운
   행(y=95, 125)은 먼 행과 70~80px 어긋난다. 그래서 `target_y_end`를 95로 두어 먼 행 3개만
@@ -548,8 +649,118 @@ python3 firmware/tools/steer_pwm_sweep.py
   행별 폭을 쓰도록 고치면 5개로 늘릴 수 있다.
 - **조향 해상도.** `MotionCommand.steering`이 `int32`라 `±max_steer_cmd`(=9) 정수 19단계다.
   더 세밀하게 하려면 `max_steer_cmd`를 키우거나(양쪽 노드 값을 같이) 메시지를 float로 바꿔야 한다.
+  자세한 영향과 완화책은 11번.
 
-## 11. 문제 해결 순서 (조향·주행)
+## 11. 조향 출력 (순수 추종 + PD + 스무딩)
+
+`motion_planner_node`가 `/path_planning_result`를 받아 조향 명령을 만든다.
+
+```
+steer_cmd = compute_pp_steer_cmd()   # 순수 추종(pure pursuit)
+          + compute_pd_steer_cmd()   # 근거리 횡오차 PD 보정
+          → clamp(±max_steer_cmd)
+          → smooth_steer()           # EMA + 레이트리밋
+          → round() → MotionCommand.steering (int32)
+```
+
+### 11-1. 룩어헤드 점 선택
+
+`find_lookahead_point()`는 경로에서 **차량으로부터 `lookahead_distance` 이상 떨어진 첫 점**을 고른다.
+경로는 y 오름차순, 즉 **먼 쪽 → 가까운 쪽** 순으로 들어오므로 반드시 `reversed()`로 가까운 쪽부터
+훑어야 한다.
+
+예전에는 들어온 순서 그대로(먼 쪽부터) 훑었다. 경로 최대 길이가 174px(차량 y=179, 최원점 y=5)이라
+`lookahead_distance`가 174보다 작기만 하면 **최원점이 첫 검사에서 항상 통과**했다. 즉 120이든 170이든
+똑같이 y=5 한 점만 봤고, 파라미터는 참조점 선택에 아무 영향이 없었다. 그 결과 곡선에서 중간 점
+(y=35/65/95)의 형상을 못 읽고 최원점을 직선으로 겨냥해 **안쪽을 가로질렀다(인코스)**.
+
+### 11-2. 조향각 공식의 분모
+
+```python
+lookahead_dist = math.hypot(lx - car_x, ly - car_y)     # 실제로 고른 점까지의 거리
+steer_angle = math.atan2(2.0 * wheelbase * math.sin(alpha), lookahead_dist)
+```
+
+분모는 **파라미터가 아니라 실거리**여야 한다. 선택이 정상이면 둘이 거의 같지만, 경로가
+`lookahead_distance`보다 짧아 더 먼 점으로 대체되면 그 비율만큼 조향이 과해진다.
+예전에는 분모에 파라미터를 그대로 썼고, 11-1의 선택 버그와 겹쳐 실거리 174px에 분모 120을 쓰는
+**1.45배 과조향**이 상시로 나갔다.
+
+두 수정의 합산 효과(원호 경로 시뮬레이션, `lookahead_distance=120` 유지):
+
+| 곡률반경 | 기존 조향 / 참조점 | 수정 후 조향 / 참조점 |
+|---|---|---|
+| R=400px | 2.83 / y=5 | 1.98 / y=59 |
+| R=300px | 3.64 / y=5 | 2.57 / y=59 |
+| R=200px | 4.99 / y=5 | 3.62 / y=63 |
+| R=150px | 5.99 / y=5 | 4.48 / y=65 |
+
+조향량이 약 30% 줄고 참조점이 경로 중간으로 내려온다.
+
+> **[현재 상태]** 위 수정(11-1, 11-2) 직후 `lookahead_distance=120`을 그대로 두면 직진 횡오차
+> 보정이 1.44배 과보정(위빙), 곡선 조향은 0.49배로 부족해져 직진조차 어려웠다. 그래서 지금은
+> **170**으로 올려 수정 전과 비슷한 참조점(y≈12 부근)이 나오도록 맞춰 둔 상태다. 이건 10번의
+> `lane_penalty`/`path_change_cost` 진단이 끝나기 전까지 다른 변수를 고정하기 위한 값이라,
+> 그 진단이 끝나면 여기서부터 다시 하나씩(11-5 순서대로) 조여야 한다.
+
+### 11-3. 출력 스무딩
+
+조향 명령은 `int32`로 반올림되고 `serial_sender_node`가 `max_steer_cmd`로 나눠 -1.0~1.0으로
+정규화한다. 즉 **명령 1칸 = 전체 조향의 1/9**이고, 조향 포텐셔미터로는 좌 `70/9≈7.8`,
+우 `106/9≈11.8` counts다(펌웨어 440/510/616). 펌웨어 `STEERING_DEADBAND`가 6이라
+**한 칸만 바뀌어도 항상 데드밴드를 넘어** 앞바퀴 모터가 켜졌다 확 밀고 꺼진다.
+
+저속에서는 같은 곡률을 도는 데 제어 틱이 더 많이 들어가므로 이 계단이 하나씩 다 "틱틱"으로
+느껴진다. `smooth_steer()`가 EMA와 레이트리밋으로 한 번의 큰 변화를 여러 틱에 나눠 보내
+그 충격을 줄인다.
+
+- 필터 상태(`steer_state`)는 **반올림 전 float**으로 유지한다. 반올림된 값을 되먹이면
+  필터가 정수 격자에 갇혀 목표에 영영 못 닿는다.
+- 정지(`publish_stop()`) 시 `steer_state`와 `prev_dx`를 0으로 리셋한다. 펌웨어는 `rear_pwm`과
+  무관하게 `targetSteering`을 갱신하므로 정지 중 바퀴는 실제로 중립으로 간다.
+
+10Hz 기준 동작:
+
+| 입력 | 출력(반올림 후) |
+|---|---|
+| 0 → 9 스텝 | `3, 5, 7, 8, 8, 9` — 약 0.5s에 도달 |
+| ±2 채터링 | `±0.5` → 반올림하면 대부분 0 (모터가 아예 안 움직임) |
+| ±4 채터링 | `±1.0` (기존 pot 47counts → 12counts) |
+| D항 스파이크 `2,2,5,2,2,5` | `1,1,3,2,2,3` |
+
+> 입력이 `±max_steer_cmd`를 매 틱 오가는 극단적 진동이면 레이트리밋이 계속 걸리면서 출력 평균이
+> 한쪽으로 치우친다(±9 입력 → 0~3 왕복). 그 정도로 떨고 있으면 스무딩이 아니라 상류(경로/PD)를
+> 봐야 한다. 실제 진폭인 ±2~4에서는 레이트리밋이 걸리지 않아 대칭이다.
+
+### 11-4. 파라미터
+
+| 파라미터 | 값 | 의미 |
+|---|---|---|
+| `lookahead_distance` | 170.0 | 참조점까지의 거리(px). **작을수록 민감·인코스 감소**, 클수록 완만·인코스 증가 |
+| `wheelbase` | 50.0 | 가상 휠베이스. 클수록 조향 계산이 완만 |
+| `max_steer_angle_rad` | 0.55 | 조향각 정규화 기준. 작을수록 출력이 커짐 |
+| `max_steer_cmd` | 9.0 | 최종 명령 최대 절대값. `serial_sender_node`와 **같은 값**이어야 함 |
+| `Kp` / `Kd` | 0.01 / 0.045 | PD 보정 이득. `lookahead_y`(155) 행의 횡오차 기준 |
+| `steer_smoothing_alpha` | 0.4 | EMA 계수. **1.0이면 스무딩 없음**. 10Hz에서 0.4면 시정수 약 0.2s |
+| `steer_rate_limit` | 3.0 | 틱당 최대 변화량(전체 범위 ±9). 3.0이면 풀조향 왕복에 최소 0.6s. 0 이하면 제한 없음 |
+
+`Kp`/`Kd`/`max_steer`/`steer_speed_gain`은 모두 `steer_cmd`와 같은 단위다. **`max_steer_cmd`를
+바꾸면 이들을 같은 비율로 스케일해야 한다.** (예: 해상도를 높이려고 9 → 90으로 올리면
+`Kp` 0.01→0.1, `Kd` 0.045→0.45, `max_steer` 4.0→40.0, `steer_speed_gain` 12.0→1.2)
+
+### 11-5. 튜닝 순서
+
+1. **곡선에서 인코스로 파고든다** → 10번의 `lane_center_tilt_comp`(인지 원인)와
+   `path_planner_node`의 `lane_penalty`(경로 생성 원인, 수정 완료)는 이미 손봤다. 그래도
+   남으면 `lookahead_distance`를 **낮춘다**(현재 기준값 170 → 140 → 120 → …).
+   참조점이 차량 쪽으로 내려와 곡선을 가로지르지 않는다.
+2. **곡선에서 조향이 과하다** → 같은 방향으로 `max_steer_angle_rad`를 키우거나 `wheelbase`를 키운다.
+3. **여전히 틱틱거린다** → `steer_smoothing_alpha`를 0.4 → 0.25로.
+4. **코너 진입이 굼뜨다** → `steer_smoothing_alpha`를 0.4 → 0.5~0.6으로. 속도를 올릴수록
+   같이 올려야 한다(스무딩 지연 동안 차가 더 많이 나가므로).
+5. **위로 안 잡히면** 분해능 한계다. `max_steer_cmd`를 키우고 위 표대로 이득을 재스케일한다.
+
+## 12. 문제 해결 순서 (조향·주행)
 
 증상별로 확인할 곳이 다르다. 위에서부터 순서대로 좁힌다.
 
@@ -563,4 +774,57 @@ python3 firmware/tools/steer_pwm_sweep.py
    `drive_straight.py`로 확인.
 6. **직진은 되는데 자율주행에서 한쪽으로 치우친다** — 인식 기준점. `car_center_x`와
    `lane_width_for_center`(10번).
-7. **곡선에서 못 따라간다** — `lookahead_distance`(작을수록 민감). 경로 점 개수도 함께 볼 것.
+7. **곡선에서 인코스 선을 밟는다 / 곡선에서만 조향이 과하다** — 먼저 **인지**를 의심한다.
+   차선 기울기 보정(`lane_center_tilt_comp`, 10번)이 꺼져 있으면 곡선에서 타겟이 추종 중인
+   선 쪽으로 최대 폭의 절반만큼 끌려간다. 제어 게인을 만지기 전에 이걸 먼저 볼 것.
+8. **곡선을 못 따라간다(바깥으로 밀린다)** — 룩어헤드(11-1, 11-2).
+   `lookahead_distance`는 **작을수록 민감하고 인코스가 준다**. 경로 점 개수도 함께 볼 것.
+9. **조향이 부드럽지 않고 틱틱거린다** — 조향 해상도와 펌웨어 데드밴드(11-3).
+   `steer_smoothing_alpha`를 낮춘다. 그래도 남으면 `max_steer_cmd`를 키운다(11-4).
+
+## 13. 변경 이력
+
+### 2026-08-14
+
+**곡선 인코스(안쪽으로 붙어서 주행) 진단/수정**
+- `lane_center_tilt_comp`: `0.0`(진단용) → `0.5` 시운전 → `1.0`(완전 보정)으로 상향. 10번 참고.
+- `path_planner_node`의 `lane_penalty` 수식 버그 수정: "후보가 자기 평균에서 흩어진 정도"를
+  재던 걸 "후보와 실제 차선 중심(`x_points`)의 편차"로 고쳤다. 곡선에서 오히려 경로를 펴버리는
+  오프셋이 더 싸게 나오던 문제. 10번 참고.
+- `path_change_cost`: 원인 확인용으로 올려뒀던 `10.0`을 원래 목적(지그재그 억제)에 맞는
+  `0.05`로 복원.
+- `roi_cutting_idx`: `300` → `260`으로 낮춰 타겟 포인트 추출 범위를 조금 더 원거리로 확장
+  (곡선을 더 일찍 읽도록). `lane_width_for_center`(216)가 이 확장된 구간에서도 맞는지는
+  미검증 — 시운전하며 `target_points`가 튀는지 볼 것.
+
+**속도**
+- `base_speed`/`min_speed`/`max_speed`: `30` → `40` (+33%). 저속 튜닝 모드(셋 다 동일값)는 유지.
+
+**장애물 회피 — 인식 끊김에 의한 조기 복귀(콘 충돌) 수정**
+- `lane_info_extractor_node`에 `active_avoidance_offset` 상태와
+  `avoidance_release_threshold_count`(기본 15프레임) 디바운싱 추가.
+- 회피 시작은 즉시, 복귀는 "장애물이 확실히 안 겹침"이 N프레임 연속 확인돼야만 하도록 변경.
+  "미검출(정보 없음)"은 복귀 카운트에 반영되지 않고 현재 회피 상태를 그대로 유지 — 장애물에
+  가까워질수록 YOLO 인식이 끊기는 근접 구간에서 조기 복귀하다 그대로 충돌하던 사고 원인.
+
+**라이다 재연결(포트 충돌) 문제**
+- 원인: 이전 `ros2 launch` 프로세스 트리가 완전히 종료되기 전에 재launch하면 `rplidar_node`가
+  `/dev/ttyUSB0`를 못 열어 즉시 죽음(SDK 에러 `0x80008004`). 라이다 자체 고장이 아니라
+  launch 타이밍 문제였음을 로그로 확인.
+- 워크스페이스 루트에 `stop_drive.sh` 추가: 이전 launch를 정상 종료(최대 15초 대기 후
+  강제종료)까지 확인하고 포트가 비었는지 알려주는 수동 정리 스크립트.
+- `full_bringup.launch.py` 맨 앞에 `OpaqueFunction(_kill_stale_launch)` 추가: `ros2 launch`
+  실행 시 이전 launch가 살아있으면 자동으로 정리 후 시작하도록 해서, 수동으로 `stop_drive.sh`를
+  먼저 실행할 필요가 없게 함. `--show-args` 같은 정적 조회에서는 실행되지 않도록
+  OpaqueFunction으로 감쌈(실제 실행 시에만 동작 확인됨).
+
+**진단용 임시 코드 (아직 안 지움)**
+- `camera_perception_func_lib.py`의 `get_lane_center()`에 `lane_center_debug` 로거로 15프레임마다
+  분기(단일선/두선)·gap·theta·타겟값을 찍는 임시 로그가 남아있음. 곡선에서 "두 선 보임" 오분류
+  분기(→ `tilt_comp` 미적용)가 실제로 뜨는지 확인용. 확인 끝나면 제거할 것.
+
+**문서 오류 수정**
+- 2번(빌드) 섹션의 `cd ~/sensor_fusion_ws`가 잘못된 경로였음(실제 폴더명은
+  `UNITA_sensor_fusion_ws`). 이 경로로 `cd`가 조용히 실패하면 이후 `source install/setup.bash`도
+  엉뚱한 디렉터리에서 실행돼 환경이 안 잡히고, `ros2 launch`가 패키지를 못 찾아 아무것도 안 뜬다
+  ("라이다가 안 뜬다"로 보였던 원인 중 하나로 추정). `cd ~/UNITA_sensor_fusion_ws`로 정정.

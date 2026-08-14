@@ -9,7 +9,7 @@ from typing import Tuple, Optional
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from geometry_msgs.msg import TransformStamped, Point32
+from geometry_msgs.msg import TransformStamped, Point32, Polygon
 from tf2_ros import Buffer, TransformListener
 
 from sensor_msgs.msg import Image, LaserScan
@@ -96,6 +96,8 @@ class FusionVisualizerNode(Node):
         # 포맷으로 /lidar_obstacle_info를 발행한다 (minicar_sim의 box_lidar_match_node와 동일 포맷).
         self.declare_parameter('publish_obstacle_info', False)
         self.declare_parameter('obstacle_topic', '/lidar_obstacle_info')
+        # 검출된 장애물 전체. Polygon의 각 점 = (x=거리[m], y=이미지상 중심 x[px], z=박스 반폭[px])
+        self.declare_parameter('obstacle_array_topic', '/lidar_obstacle_array')
         # 장애물로 치지 않을 클래스. 차선 세그멘테이션(lane_1/lane_2)은 박스가 화면을 가득 채워서
         # 그대로 두면 "코앞에 장애물이 있다"고 잘못 나간다.
         self.declare_parameter('obstacle_class_exclude', 'lane_1,lane_2')
@@ -186,6 +188,7 @@ class FusionVisualizerNode(Node):
 
         self.publish_obstacle_info = bool(self.get_parameter('publish_obstacle_info').value)
         self.obstacle_topic = str(self.get_parameter('obstacle_topic').value)
+        self.obstacle_array_topic = str(self.get_parameter('obstacle_array_topic').value)
         self.obstacle_class_exclude = {
             c.strip() for c in str(self.get_parameter('obstacle_class_exclude').value).split(',') if c.strip()
         }
@@ -291,8 +294,14 @@ class FusionVisualizerNode(Node):
 
         if self.publish_obstacle_info:
             self.pub_obstacle = self.create_publisher(Point32, self.obstacle_topic, 10)
+            # 가장 가까운 하나만 보내면, 그걸 피해 지나가 박스가 사라지는 순간
+            # 직전 장애물이 판단에서 통째로 빠져 다음 장애물만 보고 꺾다가 들이받는다.
+            # 검출된 장애물 전부를 같이 내보내서 동시에 고려할 수 있게 한다.
+            self.pub_obstacle_array = self.create_publisher(
+                Polygon, self.obstacle_array_topic, 10)
         else:
             self.pub_obstacle = None
+            self.pub_obstacle_array = None
 
         if self.display:
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -562,7 +571,16 @@ class FusionVisualizerNode(Node):
             self.pub_img.publish(out_msg)
 
     def _publish_obstacle_info(self, det_ok, scan_ok, u_pix, v_pix, ranges, w, h):
-        """가장 가까운 장애물을 Point32(x=거리[m], y=이미지상 중심 x[px], z=감지 플래그)로 발행.
+        """장애물 정보를 두 토픽으로 발행한다.
+
+        - obstacle_topic       : 가장 가까운 장애물 하나.
+                                 Point32(x=거리[m], y=이미지상 중심 x[px], z=감지 플래그)
+        - obstacle_array_topic : 검출된 장애물 전부.
+                                 Polygon의 각 점 = (x=거리[m], y=중심 x[px], z=박스 반폭[px])
+
+        하나만 보내면 그 장애물을 피해 지나가 박스가 사라지는 순간 판단에서 통째로
+        빠지고, 다음 장애물만 보고 꺾다가 직전 장애물을 들이받는다. 그래서 전부 보낸다.
+        (기존 단일 토픽은 호환을 위해 그대로 둔다)
 
         박스별 거리는 화면 표시와 똑같이 estimate_distance_in_bbox()로 구하므로,
         'boxes' 화면에 찍히는 거리와 판단 노드가 받는 거리가 항상 같다.
@@ -570,6 +588,7 @@ class FusionVisualizerNode(Node):
         """
         closest_dist = None
         closest_cx = -1.0
+        obstacles = []          # (거리[m], 중심x[px], 반폭[px])
 
         if det_ok and scan_ok and len(ranges) > 0:
             for det in self.last_det.detections:
@@ -596,9 +615,21 @@ class FusionVisualizerNode(Node):
                 if dist_m is None:
                     continue
 
+                cx = (x1c + x2c) / 2.0
+                half_w = max(1.0, (x2c - x1c) / 2.0)
+                obstacles.append((float(dist_m), float(cx), float(half_w)))
+
                 if closest_dist is None or dist_m < closest_dist:
                     closest_dist = dist_m
-                    closest_cx = (x1c + x2c) / 2.0
+                    closest_cx = cx
+
+        if self.pub_obstacle_array is not None:
+            arr = Polygon()
+            for d, cx, half_w in obstacles:
+                p = Point32()
+                p.x, p.y, p.z = d, cx, half_w
+                arr.points.append(p)
+            self.pub_obstacle_array.publish(arr)
 
         obs_msg = Point32()
         if closest_dist is not None:
