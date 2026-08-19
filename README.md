@@ -571,7 +571,7 @@ python3 firmware/tools/steer_pwm_sweep.py
 | **60°** | **216.0px** | 108px | **108.0px** |
 
 60°에서 부족분이 정확히 폭의 절반이다. 즉 **타겟이 선 위에 그대로 얹힌다.**
-`lane_2`(좌측선, 08-18 실측으로 좌/우 정정됨 — 13번 참고)를 추종하는 좌회전 구간에서는
+`lane_2`(좌측선, 08-18 실측으로 좌/우 정정됨 — 14번 참고)를 추종하는 좌회전 구간에서는
 그 선이 곧 인코스라, "곡선에서 인코스 선을 밟고 주행"으로 나타났다.
 
 `theta`는 `dominant_gradient()`가 이미 구해 `get_lane_center()`에 넘겨주던 값인데
@@ -782,7 +782,302 @@ steer_angle = math.atan2(2.0 * wheelbase * math.sin(alpha), lookahead_dist)
 9. **조향이 부드럽지 않고 틱틱거린다** — 조향 해상도와 펌웨어 데드밴드(11-3).
    `steer_smoothing_alpha`를 낮춘다. 그래도 남으면 `max_steer_cmd`를 키운다(11-4).
 
-## 13. 변경 이력
+## 13. 후방 서라운드 BEV (카메라 2/3/4)
+
+후방 카메라 1대 + 좌/우 카메라 2대를 지면에 투영해서, 차 뒤를 위에서 내려다본 한 장으로
+합친다. 후진/주차할 때 세 화면을 번갈아 보지 않아도 되게 하는 게 목적이다.
+
+- `camera_2` (by-path 2.2.4.1) — 후방, 뒤를 정면으로 본다
+- `camera_3` (by-path 2.2.4.2) — 좌측, 비스듬히 뒤를 본다
+- `camera_4` (by-path 2.2.4.3) — 우측, 비스듬히 뒤를 본다
+
+원리는 단순하다. **지면이 평면이라고 가정하면** 카메라 영상의 한 점과 지면의 한 점은
+호모그래피 하나로 1:1 대응하고, 그 호모그래피는 대응점 네 쌍이면 결정된다. 그래서 각
+카메라마다 "영상 속 지면 사다리꼴 네 점(`src_points`)"과 "그 점이 top-down 캔버스에서
+놓일 자리(`dst_points`)"만 정해주면 된다. 이 가정이 깨질 때 무슨 일이 생기는지는 아래
+"한계"에 적었다.
+
+### 13-1. 캔버스 좌표계 — 왜 지금 안 쓰는 앞쪽까지 잡아뒀나
+
+캔버스는 **차를 한가운데 둔 800x1000 지면 좌표계**다. 위가 차 앞, 아래가 차 뒤,
+x가 클수록 차의 오른쪽이고 `[310,370,490,630]`이 차량 자리다.
+
+지금 쓰는 건 뒤쪽뿐인데 앞쪽까지 잡아둔 이유는 `dst_points`가 **이 캔버스의 픽셀
+좌표로 저장되기 때문**이다. 나중에 전방 카메라를 붙이면서 캔버스를 넓히면, 힘들게 찍어둔
+네 점이 전부 어긋나서 세 카메라를 처음부터 다시 맞춰야 한다. 그래서 좌표계는 처음부터
+최종 형태로 못박고, 당장 안 쓰는 앞쪽은 `view_rect: [0, 340, 800, 1000]`로 잘라낸다.
+
+이 크롭은 다 그린 뒤에 잘라내는 게 아니라 **평행이동을 호모그래피에 미리 곱해서** 애초에
+그 영역만 워핑한다. 안 쓰는 영역은 계산 자체를 안 하므로 그만큼 빠르다.
+
+전방을 추가할 때는 `front.enabled: true` + `view_rect: [0, 0, 800, 1000]`으로 바꾸고
+전방 네 점만 찍으면 된다. 후방/좌우는 다시 안 찍어도 된다.
+
+### 13-2. 겹치는 영역 — 평균내지 않고 후방에 우선권을 준다
+
+좌/우 카메라가 비스듬히 뒤를 보고 있어서 후방과 겹치는 영역이 넓다. 처음에는 겹치는 곳을
+가중 평균했는데(`blend_mode: average`), 광각 왜곡이 심한 측면 영상이 선명한 후방 영상 위에
+번져서 **둘 다 흐려졌다**. 정렬이 완벽하지 않으면 평균은 이중상이 된다.
+
+그래서 `blend_mode: priority`를 쓴다. `blend_priority`가 높은 쪽(rear=30)이 겹치는 영역을
+가져가고, 좌/우(10)는 후방이 못 보는 바깥만 채운다. 결과적으로 화면에 보이는 어긋남은
+이음매 선 하나로 줄어든다.
+
+구현상 주의점이 하나 있다. 우선순위 순으로 알파 합성을 하되 **누적 알파로 나눠서 되돌려야**
+한다. 안 나누면 이음매를 부드럽게 하려고 넣은 깃털(feather) 구간의 알파가 1보다 작아서,
+가장 아래 레이어의 바깥 테두리가 검게 죽는다.
+
+### 13-3. ROI 피커 — 네 점을 어떻게 정할 것인가
+
+이 작업의 실질적인 난이도는 전부 여기 있다. 바닥에 마커를 놓고 자로 재서 픽셀 좌표를 손으로
+적어 넣는 건 비현실적이고, 값을 바꿀 때마다 노드를 재시작해서 확인하는 것도 못 할 짓이다.
+
+그래서 도구를 만들었다 (`roi_picker_node`, `roi_picker.launch.py`).
+
+```bash
+ros2 launch sensor_fusion_bringup roi_picker.launch.py start_cameras:=true
+```
+
+왼쪽 패널은 카메라 원본, 오른쪽 패널은 top-down 캔버스다. **바닥의 같은 지점을 양쪽
+패널에서 같은 순서로** 클릭하면 그 자리에서 워핑 결과가 캔버스에 겹쳐 나온다. 점 순서는
+사각형을 한 바퀴 도는 순서면 무엇이든 되고(두 패널에서 같은 순서이기만 하면 대응이 맞는다),
+자기교차하면 하단에 경고가 뜬다.
+
+여러 카메라를 맞추는 방법이 핵심이다. **후방을 먼저 맞춰 기준을 만들고, 좌/우는 후방
+워핑이 이미 그려진 캔버스 위에서 "후방 영상에 보이는 바로 그 바닥 지점"을 클릭한다.**
+그러면 축척과 위치가 동시에 맞는다. 겹치는 영역 밖의 점을 쓰면 기준이 없어서 어긋난다.
+
+`s`를 누르면 `params.yaml`의 해당 줄만 골라 치환한다. YAML을 파싱해서 다시 쓰면 그 파일에
+잔뜩 달린 주석이 전부 날아가기 때문에 줄 단위 치환을 쓴다. 원본은 `params.yaml.bak`으로
+백업된다.
+
+| 키 | 동작 |
+| --- | --- |
+| 좌클릭 | 점 추가 (4개 다 찍힌 뒤에는 가장 가까운 점을 그 자리로 이동) |
+| 우클릭 | 마지막 점 취소 |
+| `h` `j` `k` `l` | 마지막으로 건드린 점을 1픽셀씩 이동 |
+| `1` `2` `3` / `Tab` | 카메라 전환 (rear / left / right) |
+| `r` / `z` | 현재 카메라 초기화 / 되돌리기 |
+| `a` | dst 사각형 대충 깔아주기 (끌어다 맞추는 출발점) |
+| `d` | 확인 모드 순환: `stack` → `diff` → `blink` |
+| `x` | 카메라 패널 접고 캔버스만 크게 |
+| `w` `g` `f` | 워핑 / 격자 / 캔버스 전체 보기 |
+| `s` | `params.yaml`에 저장 |
+
+`d`(확인 모드)는 나중에 추가한 것인데, 없으면 작업이 불가능했다. 기본 `stack` 모드는
+우선순위가 높은 후방이 좌/우를 **덮어써서**, 정작 겹치는 영역에서 얼마나 어긋났는지 볼 수가
+없다. `diff`는 겹치는 영역을 `|현재 카메라 − 나머지|`로 그려서 **맞으면 까맣게** 되고,
+`blink`는 두 영상을 2.5Hz로 번갈아 보여준다(사람 눈은 정지 비교보다 깜빡임에 훨씬 민감하다).
+
+### 13-4. 실행 — 명령어 전체 순서
+
+**0) 빌드 (처음 한 번, 또는 노드를 고쳤을 때)**
+
+```bash
+cd ~/UNITA_sensor_fusion_ws
+colcon build --packages-select camera_perception_pkg sensor_fusion_bringup --symlink-install
+source install/setup.bash
+```
+
+`--symlink-install`이라 `.py` 파일만 고친 경우엔 다시 빌드하지 않아도 된다(다음 실행부터
+바로 반영). `setup.py`의 entry_points를 건드렸을 때만 다시 빌드하면 된다.
+
+**1) 카메라 장치 확인 (재연결/재부팅 후)**
+
+```bash
+ros2 run camera_perception_pkg list_cameras --probe
+ls /dev/v4l/by-path/          # by-path 경로가 params.yaml의 camera_device와 맞는지
+```
+
+C920이 여러 대라 by-id가 서로 겹쳐서 못 쓴다. 반드시 **by-path**(꽂은 포트 기준)를 쓴다.
+포트를 바꿔 꽂으면 경로가 깨지므로 위 명령으로 다시 확인할 것.
+
+**2) 카메라 3대 원본을 격자로 확인**
+
+```bash
+ros2 launch sensor_fusion_bringup multi_camera_view.launch.py
+```
+
+`/camera_2,3,4/image_raw`를 한 창에 붙여서 보여준다. 프레임이 안 오는 카메라는 회색
+`NO SIGNAL` 타일로 표시되므로, 창이 아예 안 뜨는 것과 카메라 하나만 죽은 것을 구분할 수 있다.
+런치 인자: `show_preview`, `tile_width`(기본 480), `tile_height`(360), `resizable_window`.
+
+**3) ROI 찍기 (13-3 참고)**
+
+```bash
+# 카메라가 이미 떠 있으면
+ros2 launch sensor_fusion_bringup roi_picker.launch.py
+
+# 아무것도 안 떠 있으면 카메라까지 같이
+ros2 launch sensor_fusion_bringup roi_picker.launch.py start_cameras:=true
+```
+
+`3` → `x`(캔버스 크게) → `d` 두 번(diff 모드)으로 이음매를 보면서 맞추고 `s`로 저장.
+
+**4) 서라운드 BEV 실행**
+
+```bash
+ros2 launch sensor_fusion_bringup rear_surround_view.launch.py start_cameras:=true
+
+# 창 없이 토픽만 (원격/헤드리스)
+ros2 launch sensor_fusion_bringup rear_surround_view.launch.py \
+    start_cameras:=true show_preview:=false
+
+# 카메라별 커버리지 윤곽선 표시 (정렬 확인용)
+ros2 launch sensor_fusion_bringup rear_surround_view.launch.py \
+    start_cameras:=true draw_camera_outlines:=true
+
+# 겹치는 곳을 평균내는 예전 방식으로 비교해보고 싶을 때
+ros2 launch sensor_fusion_bringup rear_surround_view.launch.py \
+    start_cameras:=true blend_mode:=average
+```
+
+두 런치 모두 `start_cameras`가 기본 `false`다. 이미 카메라 노드가 떠 있는데 여기서 또 열면
+`/dev/video*`를 이미 잡고 있어서 `cv2.VideoCapture`가 실패한다. 카메라가 안 떠 있을 때만
+`start_cameras:=true`를 준다. 카메라를 2초씩 벌려 켜는 것도 같은 이유다 — 동시에 열면
+VideoCapture가 멈추거나 열기 자체가 깨진다(USB 전원이 빠듯한 구성).
+
+**5) 동작 확인 (다른 터미널에서)**
+
+```bash
+source ~/UNITA_sensor_fusion_ws/install/setup.bash
+
+ros2 node list                     # camera_2/3/4_node + surround_view_node
+ros2 topic hz /camera_2/image_raw  # 각 카메라 20~28Hz 정도
+ros2 topic hz /surround_view/image # 13~19Hz (다른 노드와 CPU 경합에 따라)
+ros2 topic info -v /surround_view/image
+```
+
+**6) 개별 노드로 나눠서 실행 (문제 추적용)**
+
+```bash
+# 카메라 한 대만
+ros2 run camera_perception_pkg image_publisher_node --ros-args \
+    --params-file install/sensor_fusion_bringup/share/sensor_fusion_bringup/config/params.yaml \
+    -r __node:=camera_2_node
+
+# 서라운드 노드만 (카메라가 먼저 떠 있어야 함)
+ros2 run camera_perception_pkg surround_view_node --ros-args \
+    --params-file install/sensor_fusion_bringup/share/sensor_fusion_bringup/config/params.yaml \
+    -r __node:=surround_view_node -p show_preview:=false
+
+# 피커만
+ros2 run camera_perception_pkg roi_picker_node --ros-args \
+    --params-file install/sensor_fusion_bringup/share/sensor_fusion_bringup/config/params.yaml \
+    -r __node:=roi_picker_node
+```
+
+**7) 종료**
+
+```
+Ctrl+C          # 런치를 띄운 터미널에서
+```
+
+`ros2 launch`를 죽여도 **자식 노드가 고아로 남는 경우가 있다**(실제로 겪었다). 창이 그대로
+떠 있거나 `/dev/video*`가 계속 잡혀 있으면 직접 정리한다.
+
+```bash
+pgrep -af "surround_view_node|image_publisher_node|roi_picker_node"
+pkill -f "[s]urround_view_node"      # 대괄호는 pkill이 자기 명령줄을 매칭하지 않게 하는 관용구
+pkill -f "[i]mage_publisher_node"
+pkill -f "[r]oi_picker_node"
+```
+
+**자주 나는 문제**
+
+| 증상 | 원인 / 확인 |
+| --- | --- |
+| `VideoCapture` 실패, 창이 안 뜸 | 다른 노드가 `/dev/video*`를 잡고 있다. 위 `pgrep`으로 확인 |
+| 특정 타일만 `NO SIGNAL` | 그 카메라의 USB가 빠졌거나 by-path 경로가 바뀜. `list_cameras --probe` |
+| 피커에서 키가 안 먹음 | OpenCV 창은 **포커스가 있어야** 키를 받는다. 창을 클릭한 뒤 누를 것 |
+| 창이 화면 밖으로 잘림 | 이 장비 화면이 1024x768이다. `roi_picker_node.pane_height`(기본 340)를 줄인다 |
+| `No package metadata was found` | `install/setup.bash`를 source 안 했거나 워크스페이스 밖에서 실행함 |
+
+### 13-5. 실제로 맞춘 과정 — 무엇이 통했고 무엇이 안 통했나
+
+바닥이 체커보드라 정렬 확인에 유리한 조건이었는데도 쉽지 않았다. 기록해 둔다.
+
+**1) 축척 불일치 (첫 시도)** — 카메라마다 체커보드 한 칸이 캔버스에서 30px / 57px / 64px로
+2배 넘게 차이 났다. 카메라별로 제각각인 바닥 지점을 찍고 dst도 제각각인 크기로 놓은 탓이다.
+**캔버스 격자(50px)를 자로 삼아 "체커보드 1칸 = 격자 1칸"으로 통일**하니 해결됐다.
+
+**2) 후방이 기준이다** — 후방을 옮기면 좌/우가 **동시에** 어긋난다. 실제로 우측을 맞추려고
+후방을 건드렸다가 좌측이 0.950 → 0.577로 무너진 적이 있다. 후방을 바꿔야 한다면 좌/우를
+반드시 다시 맞춰야 한다. (반대로, 후방을 옮긴 게 더 나은 기준이었던 경우도 있었다 — 그때는
+되돌리지 말고 좌/우를 새 기준에 다시 맞추는 게 맞다.)
+
+**3) 자동 정렬 시도 — 대부분 실패했다**
+
+- **ECC 영상 정합**(`cv2.findTransformECC`, euclidean/affine/homography): 전부 수렴 실패.
+  체커보드가 반복 무늬라 목적함수에 국소최소가 촘촘히 깔려 있어서 옆 칸에 붙어버린다.
+- **평행이동 브루트포스**(±45px 전수 탐색): 좌측은 MAD 55.4 → 31.4로 확실히 좋아졌지만,
+  우측은 51.7 → 47.8로 거의 무효였다. 우측 오차가 단순 평행이동이 아니라는 뜻이다.
+- **dst 네 점 자유(8자유도) 좌표하강**: 우측 MAD 47.6 → 39.2로 줄긴 했는데 점이 **144px**
+  움직이면서 y가 1040까지, 즉 캔버스(높이 1000) 밖으로 나갔다. 좁은 이음매 띠에 과적합한
+  것이라 폐기했다.
+
+결국 **사람이 `diff` 모드를 보면서 손으로 맞추는 게 가장 잘 통했다.** 자동화는 좌측의
+평행이동 보정 한 번만 실제로 기여했다.
+
+### 13-6. 정렬을 어떻게 측정했나 — 그리고 그 지표의 한계
+
+겹치는 영역에서 두 워핑 영상의 **평균절대차(MAD)와 상관계수**를 쟀다. 눈으로 보는 것보다
+객관적이지만, 이 지표에는 함정이 세 개 있다.
+
+- **반복 무늬에서 값이 접힌다.** 체커보드는 반 칸(약 35px) 밀리면 MAD가 최대가 되고 한 칸
+  밀리면 다시 0으로 돌아온다. 그래서 "몇 px 어긋났다"를 읽을 수 없고, 거리별 오차 추세도
+  단조롭게 나오지 않는다. 두 설정의 우열을 가리는 데는 쓸 수 있어도 절대 크기는 못 읽는다.
+- **겹치는 면적이 다르면 평균 비교가 불공정하다.** ROI를 넓히면 안 맞는 바깥 영역이 평균에
+  더 들어와서 나빠 보인다. 반드시 **두 설정의 공통 픽셀에서만** 비교해야 한다.
+- **장면이 변하면 값이 요동친다.** 실제로 이음매를 걸어서 확인하는 동안 측정값이
+  우측 +0.92 ↔ -0.03으로 튀었다. 사람이 화면에 들어왔다 나갔다 한 탓이다.
+
+**가장 믿을 만한 검사는 이음매를 밟고 지나가며 발이 이어지는지 보는 것이다.** 발은 반복되지
+않는 물체라 이어지면 이어진 것이고, 체커보드 상관계수가 못 보는 걸 본다.
+
+### 13-7. 성능 — 6Hz에서 17Hz로
+
+처음 돌렸을 때 목표 20Hz에 한참 못 미치는 5.7Hz가 나왔다. 원인은 **매 프레임 다시 계산하던
+상수**였다.
+
+- 깃털 처리용 `GaussianBlur`: 800x600에서 15ms, 카메라 3대분
+- 블렌딩(float32 알파 합성 3장): 55ms
+
+호모그래피도 블렌딩 마스크도 가중치도 **입력 해상도에만 의존**하므로 한 번 구하면 그만이다.
+캐시로 바꾸고(7.2Hz), 블렌딩은 **정규화된 가중치를 미리 만들어 두고 프레임당 가중합 한
+번**으로 바꿔서(55ms → 15.6ms) 19Hz까지 올렸다. 수식은 그대로라 결과 이미지는 동일하다
+(참조 구현 대조 시 최대 차이 1, 부동소수 연산 순서 차이).
+
+가중치는 **살아있는 카메라 조합별로** 캐시한다. 한 대가 끊기면 남은 조합으로 다시
+정규화해야 하기 때문이다.
+
+### 13-8. 한계와 다음 단계
+
+체커보드 바닥에서 실측한 최종 정렬은 **후방↔우측 상관 0.92, 후방↔좌측 0.52**다.
+
+가장 큰 제약은 **바닥이 완전한 평면이 아니라는 것**이다. 기준으로 쓴 판이 휘어 있어서
+호모그래피의 전제가 깨진다. 이러면 네 점 중 어디를 맞추든 나머지가 틀어지고, 실제로 수동
+조정을 세 번 반복해도 0.885 / 0.772 / 0.854로 수렴하지 않고 잡음 안에서 오갔다.
+
+- **N점 최소자승** — 점을 5개 이상 찍어 `cv2.findHomography`로 풀면 휨이 여러 점에 분산돼
+  "평균적으로 가장 덜 틀린" 평면이 잡힌다. 4점 한계를 실제로 넘는 방법이다.
+- **렌즈 왜곡 보정** — 광각 왜곡이 측면 카메라에서 특히 크다. 내부파라미터(fx/fy/cx/cy,
+  distortion)는 `params.yaml`의 각 `camera_N_node` 섹션에 이미 저장돼 있지만 아직 어떤
+  노드도 읽지 않는다. 여기를 붙이면 측면이 눈에 띄게 좋아질 것이다.
+- **전방 카메라 추가** — 13-1에 적은 대로 `view_rect`만 비우면 좌표계는 그대로 쓴다.
+
+## 14. 변경 이력
+
+### 2026-08-19
+
+**후방 서라운드 BEV 추가 (13번)**
+- 카메라 2/3/4를 지면 투영해 한 장으로 합치는 `surround_view_node` 정비, 네 점을 마우스로
+  찍는 `roi_picker_node` 신규 작성, 런치 2개 추가.
+- 겹치는 영역을 평균내면 왜곡 심한 측면이 후방 위에 번져서 `blend_mode: priority` 도입.
+- 캔버스를 차 중심 800x1000으로 못박고 `view_rect`로 크롭 — 전방 카메라를 나중에 붙여도
+  찍어둔 점이 유효하도록.
+- 호모그래피/마스크/가중치 캐시로 5.7Hz → 17Hz.
+- 실측 정렬 후방↔우측 0.92, 후방↔좌측 0.52. 바닥 판이 휘어 평면 가정이 깨지는 게 한계.
 
 ### 2026-08-14
 
