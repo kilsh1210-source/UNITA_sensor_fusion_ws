@@ -571,8 +571,8 @@ python3 firmware/tools/steer_pwm_sweep.py
 | **60°** | **216.0px** | 108px | **108.0px** |
 
 60°에서 부족분이 정확히 폭의 절반이다. 즉 **타겟이 선 위에 그대로 얹힌다.**
-`lane_2`(우측선)를 추종하는 우회전 구간에서는 그 선이 곧 인코스라,
-"곡선에서 인코스 선을 밟고 주행"으로 나타났다.
+`lane_2`(좌측선, 08-18 실측으로 좌/우 정정됨 — 13번 참고)를 추종하는 좌회전 구간에서는
+그 선이 곧 인코스라, "곡선에서 인코스 선을 밟고 주행"으로 나타났다.
 
 `theta`는 `dominant_gradient()`가 이미 구해 `get_lane_center()`에 넘겨주던 값인데
 그동안 부호 판정 폴백에만 쓰이고 보정에는 안 쓰였다. 현재 값은 아래로 확인한다.
@@ -828,3 +828,76 @@ steer_angle = math.atan2(2.0 * wheelbase * math.sin(alpha), lookahead_dist)
   `UNITA_sensor_fusion_ws`). 이 경로로 `cd`가 조용히 실패하면 이후 `source install/setup.bash`도
   엉뚱한 디렉터리에서 실행돼 환경이 안 잡히고, `ros2 launch`가 패키지를 못 찾아 아무것도 안 뜬다
   ("라이다가 안 뜬다"로 보였던 원인 중 하나로 추정). `cd ~/UNITA_sensor_fusion_ws`로 정정.
+
+### 2026-08-18
+
+**차선 인식 오분류 원인 확정 및 수정 — 08-14에 남겨둔 진단 로그로 실제로 잡았다**
+- 실주행 로그에서 `get_lane_center()`의 "두 선 보임" 분기(`gap < lane_width/3`=72px일 때만
+  타야 함)가 **gap 300px 안팎에서도 계속 잘못 발동**하는 게 확인됐다. 이 분기를 타면
+  "두 선의 중점"이라며 사실상 무관한 두 점의 평균을 타겟으로 써서 값이 계속 밀리고
+  (`raw_target_x` 382→491px로 표류), 결국 `Not enough valid lane points`로 인식이
+  통째로 무너졌다. **차선 밖으로 나가 벽에 부딪힌 원인이 이것이었다.**
+- 이 분기에서는 `tilt_comp`가 아예 적용이 안 돼서, 08-14에 `tilt_comp`를 0.5→1.0→0.0으로
+  계속 바꿔봐도 증상이 그대로였던 이유도 이걸로 설명된다 — 애초에 잘못된 분기를 보고 있었다.
+- `lane_center_force_single_line: false → true`로 이 분기를 막았다. 항상 단일선+half_width
+  (±`tilt_comp`) 계산을 쓰게 된다. 주의: `lane_width_for_center`(216)는 이 분기가 섞여 있던
+  상태에서 역산된 값이라 재보정이 필요할 수 있다(README 10번). `tilt_comp`는 0.0으로 꺼둔
+  채 우선 안정성부터 확인하고, 이제는 실제로 적용되니 그 다음에 다시 조정할 것.
+
+**장애물 회피 동작을 "일시 회피 후 자동 복귀"에서 "옮긴 차선 유지 후 재회피"로 변경**
+- 기존: 장애물을 피해 옆 차선으로 옮긴 뒤, 장애물이 안 보이면(N프레임 연속 확인) 자동으로
+  원래 차선에 복귀.
+- 변경: 옮긴 차선을 계속 유지하며 주행하다가, **그 차선에서 새 장애물을 만나야만** 반대쪽으로
+  다시 옮긴다. 진입/복귀 둘 다 "지금 있는 차선에 장애물 확인"이라는 같은 이벤트로 통일해서
+  즉시 반응(시간 기반 디바운싱 제거, `avoidance_release_threshold_count` 파라미터도 함께 제거).
+- **회피 중 차선 전환 시 위치가 튀던 버그 수정**: 회피로 `current_offset`이 이동 중일 때
+  추종 선이 바뀌면(예: 회피하려고 옆으로 옮겨서 원래 선이 화면에서 사라짐) 그 순간
+  `final_offset_modifier`가 한 프레임 만에 `±lane_width_pixel`만큼 튀는데, `current_offset`이
+  이 전환을 모른 채 이전 값을 그대로 이어받아 최종 타겟이 차선 폭만큼 더 밀렸다("옆 차선이
+  아니라 차선 밖으로 나감"의 원인 중 하나). `final_offset_modifier`가 바뀐 만큼
+  `current_offset`도 같이 보정해서 화면상 타겟 위치가 끊기지 않게 고쳤다.
+
+**카메라 2/3/4번 추가 (4캠 서라운드뷰 준비)**
+- 기존 1번(cam_num=0, YOLO 적용 주행용)은 안 건드림. 2번(후면, cam_num=2)/3번(좌측,
+  cam_num=4)/4번(우측, cam_num=6)을 물리 연결하고 `params.yaml`에 `camera_2_node`/
+  `camera_3_node`/`camera_4_node` 섹션으로 각각 `camera_device`(by-path)와 캘리브레이션
+  (fx/fy/cx/cy/distortion, 아직 코드에서는 안 읽음 — 왜곡보정 미구현)을 저장해뒀다.
+  YOLO/라이다 퓨전/버드아이뷰는 아직 안 붙임(추후 4대 동시 서라운드뷰 작업 때 추가 예정).
+  전용 런치파일은 안 만들고, 나중에 4대를 한 launch에 몰아넣기 쉽도록 노드 파라미터
+  섹션만 준비해둔 상태. 테스트는 `ros2 run camera_perception_pkg image_publisher_node
+  --ros-args -r __node:=camera_2_node --params-file <params.yaml 경로> -p logger:=true`처럼
+  노드 이름만 remap해서 확인.
+- C920이 여러 대라 by-id가 서로 겹쳐서(연결 순서에 따라 하나만 by-id를 가짐) 반드시
+  by-path(꽂은 포트 기준)를 써야 한다. 포트를 바꿔 꽂으면 깨지니 재연결 시
+  `list_cameras --probe`로 다시 확인할 것.
+
+**기존 1번 카메라 `camera_device` 포트 경로가 실제와 달라서 계속 실패하던 문제**
+- `image_publisher_node`의 `camera_device`가 `...-2.2.4.3:1.0-video-index0`으로 박혀 있었는데
+  실제 연결은 `...-2.2.3:1.0-video-index0`이었다. by-path는 꽂은 포트가 바뀌면 깨진다는 걸
+  코드 주석에 이미 적어뒀었는데 그대로 재현된 사례. `2.2.3`으로 정정.
+- `image_fusion_node`의 `[No Image] image_topic='/image_raw' is not arriving` 경고로
+  확인했다 — 카메라가 "멈춘 것"처럼 보였지만 실제로는 즉시 실패하고 있었을 뿐이었다.
+
+**카메라도 라이다처럼 기동 순서 분리** (`fusion_bringup.launch.py`)
+- `image_publisher_node`도 YOLO 등 무거운 노드와 동시에 뜨면 `cv2.VideoCapture()` 오픈이
+  멈추는 증상이 있었다(단독 실행은 매번 성공). 라이다(0초) → 카메라(3초) → YOLO/버드아이뷰/
+  퓨전(5초) 순으로 지연 기동하도록 변경. `decision_start_delay`도 8.0 → 10.0초로 같이 늦춤.
+
+**기타**
+- `l_shape_node`의 `launch_rviz`가 `serial_sender_node` 섹션 밑에 잘못 들어가 있어서 실제로는
+  안 읽히고 항상 `false`(fallback)였던 죽은 설정을 `l_shape_node` 섹션으로 옮기고 `false`로 명시.
+- 워크스페이스 여러 곳에 오래된 고아 프로세스(부모 `ros2 launch`가 죽은 뒤에도 계속 남아있던
+  자식 노드들)가 쌓여 있던 걸 발견하고 정리. `full_bringup.launch.py`의 자동 정리 로직은
+  "다른 `ros2 launch` 프로세스"만 찾아서 죽이므로, 부모 없이 남은 고아 노드는 못 잡는다는
+  한계가 있음(알려진 한계로 기록).
+
+**차선 좌/우 매핑이 반대였음 — `lane_2`=좌측선, `lane_1`=우측선으로 정정 (실측 확인)**
+- 지금까지 코드 전체(주석·로직)가 "lane_1=좌측선, lane_2=우측선"으로 가정하고 있었는데,
+  실제로는 반대였다. 오늘 회피 중 "왼쪽에 벽이 있는데도 왼쪽으로 이동해 차선을 완전히
+  벗어나는" 증상의 근본 원인이었다.
+- 영향받은 부분 전부 수정: `lane_info_extractor_node.py`의 `get_lane_center()` 호출 시
+  `line_side` 매핑, 회피 오프셋 부호(트리거·복귀 방향), 한쪽 선만 보일 때 반대 선으로
+  대체 추종하는 `final_offset_modifier` 부호, 박스 미검출 시 픽셀 기준 좌/우 판정.
+  `camera_perception_func_lib.py`/README의 관련 주석도 같이 정정.
+- `fixed_lane_class: 'lane_2'`(좌측선 고정 추종)라 이 오류가 특히 크게 나타났다 — 회피
+  트리거 방향이 항상 반대로 나가고 있었다.

@@ -19,7 +19,7 @@ _FALLBACK = {
     'yolov8_node': {'device': 'cuda:0'},
     'image_fusion_node': {
         'fx': 565.529459, 'cx': 337.983746, 'front_angle_deg': -180.0,
-        'display_mode': 'boxes', 'distance_tolerance': 0.6, 'draw_all_points': True,
+        'display_mode': 'boxes', 'distance_tolerance': 0.6, 'draw_all_points': True, 'display': True,
         'use_urdf_extrinsic': True, 'lidar_frame_id': 'laser',
         'camera_frame_id': 'camera_optical_frame_tilted',
     },
@@ -67,6 +67,10 @@ def generate_launch_description():
         'lidar_front_offset_deg', default=p('image_fusion_node', 'front_angle_deg'))
     cam_num = LaunchConfiguration('cam_num', default=p('image_publisher_node', 'cam_num'))
     display_mode = LaunchConfiguration('display_mode', default=p('image_fusion_node', 'display_mode'))
+    # [헤드리스 실행용] 원래 하드코딩 True였는데, 로컬 데스크톱 세션이 없으면(SSH만 붙어있으면)
+    # cv2.namedWindow가 Qt로 SIGABRT를 내며 image_fusion_node가 죽었다(실측 확인).
+    # display:=false로 끄면 창 없이 헤드리스로 돈다.
+    display = LaunchConfiguration('display', default=pbool('image_fusion_node', 'display'))
     distance_tolerance = LaunchConfiguration(
         'distance_tolerance', default=p('image_fusion_node', 'distance_tolerance'))
     draw_all_points = LaunchConfiguration(
@@ -129,6 +133,10 @@ def generate_launch_description():
             description='Fusion Visualizer 시작 화면 모드: raw / lidar / boxes / bev '
                         '(창에서 숫자키 1~4로 실행 중 전환 가능)'),
         DeclareLaunchArgument(
+            'display', default_value=display,
+            description='Fusion Visualizer 창을 띄울지 여부. 로컬 데스크톱 세션이 없으면(SSH만) '
+                        'false로 꺼야 image_fusion_node가 안 죽는다'),
+        DeclareLaunchArgument(
             'draw_all_points', default_value=draw_all_points,
             description='카메라 위에 라이다 포인트를 전부 그릴지 여부'),
         DeclareLaunchArgument(
@@ -174,10 +182,13 @@ def generate_launch_description():
             }],
         ),
 
-        # 카메라/YOLO/버드아이뷰/퓨전 — 라이다 핸드셰이크가 끝날 시간을 주기 위해 지연 시작.
+        # 카메라 — 라이다 핸드셰이크가 끝날 시간을 주기 위해 지연 시작.
+        #
+        # image_publisher_node도 rplidar_node와 같은 증상을 보였다: 카메라 단독으로는
+        # cv2.VideoCapture()가 매번 바로 열리는데(list_cameras --probe로 확인), YOLO 등
+        # 무거운 노드와 동시에 뜨면 V4L2 오픈이 그냥 멈춰버리고(futex 대기) /image_raw가
+        # 한 프레임도 안 나갔다. 그래서 카메라도 따로, YOLO보다 먼저 띄운다.
         TimerAction(period=3.0, actions=[
-            # Camera
-            # (해상도 / 오토포커스 / 자동노출 등 나머지 설정은 params.yaml에서 들어옴)
             Node(
                 package='camera_perception_pkg',
                 executable='image_publisher_node',
@@ -188,7 +199,10 @@ def generate_launch_description():
                     'logger': False,
                 }],
             ),
+        ]),
 
+        # YOLO/버드아이뷰/퓨전 — 카메라가 안정적으로 열린 뒤에 띄운다.
+        TimerAction(period=5.0, actions=[
             # YOLO detection
             # (threshold / 오탐 억제 필터는 params.yaml에서 들어옴)
             Node(
@@ -237,7 +251,7 @@ def generate_launch_description():
                     'use_urdf_extrinsic': use_urdf_extrinsic,
                     'lidar_frame_id': lidar_frame_id,
                     'camera_frame_id': camera_frame_id,
-                    'display': True,
+                    'display': display,
                     'publish_annotated': False,
                 }],
             ),
