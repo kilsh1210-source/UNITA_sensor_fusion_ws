@@ -28,7 +28,7 @@ image_publisher_node:
     # 번호(cam_num)는 재부팅마다 바뀔 수 있으므로 이 값이 있으면 그쪽이 우선.
     # 목록 확인: ros2 run camera_perception_pkg list_cameras --probe
     # 만약 화면에 다른 카메라가 나오면 아래 2.2.4.3 을 2.2.3 으로 바꾸면 된다.
-    camera_device: /dev/v4l/by-path/platform-3610000.usb-usb-0:2.2.4.3:1.0-video-index0
+    camera_device: /dev/v4l/by-path/platform-3610000.usb-usb-0:2.2.3:1.0-video-index0
     # 캘리브레이션(fx/fy/cx/cy)을 뽑은 해상도와 반드시 같아야 함
     frame_width: 640
     frame_height: 480
@@ -43,6 +43,241 @@ image_publisher_node:
     auto_white_balance: false
     white_balance: -1
     use_mjpg: true
+
+# 1번 카메라(YOLO 적용되는 기존 주행용 카메라, cam_num=0)에 이어 두 번째로 연결한
+# 카메라(2번, 물리적으로 /dev/video2). 지금은 이미지
+# 발행만 한다 - YOLO/라이다 퓨전/버드아이뷰는 나중에 추가할 예정이라 아직 안 붙였다.
+# surround_view는 안 쓴다.
+#
+# camera_device는 by-path로 고정(아래). C920이 이미 2대라 by-id가 서로 겹쳐서
+# (연결 순서에 따라 video0/video2 중 하나만 by-id를 갖고 나머지는 못 가짐) by-id는
+# 못 쓴다 - 반드시 by-path(꽂은 포트 기준)를 써야 한다. 대신 포트를 바꿔 꽂으면
+# 이 경로가 깨지니, 재연결하면 `ros2 run camera_perception_pkg list_cameras --probe`로
+# 다시 확인할 것.
+#
+# fx/fy/cx/cy/distortion은 사용자가 캘리브레이션 툴로 뽑은 값 그대로 저장.
+# 지금은 어떤 노드도 이 값을 읽지 않는다(왜곡 보정 미구현) - 나중에 라이다 퓨전/
+# 왜곡 보정 붙일 때 쓸 자리로 미리 저장해둔다. rectification/projection은
+# 단안 카메라라 camera_matrix와 사실상 중복이라 안 저장함.
+camera_2_node:
+  ros__parameters:
+    cam_num: 2
+    # C920이 이미 2대라 by-id가 서로 겹쳐서(video0 자리를 이 카메라가 가로챔)
+    # by-id는 못 쓴다. by-path(꽂은 포트 기준)로 고정. 목록 확인:
+    # ros2 run camera_perception_pkg list_cameras --probe
+    camera_device: /dev/v4l/by-path/platform-3610000.usb-usb-0:2.2.4.1:1.0-video-index0
+    pub_topic: /camera_2/image_raw
+    logger: false
+
+    frame_width: 640       # 캘리브레이션 뽑은 해상도와 반드시 같아야 함
+    frame_height: 480
+    autofocus: false
+    focus: -1
+    auto_exposure: false
+    exposure: -1
+    auto_white_balance: false
+    white_balance: -1
+    use_mjpg: true
+
+    # 캘리브레이션 (아직 코드에서 안 읽음, 향후 사용 대기)
+    fx: 557.191843
+    fy: 558.165357
+    cx: 337.174762
+    cy: 263.830370
+    distortion_k1: -0.012237
+    distortion_k2: -0.122393
+    distortion_p1: -0.000647
+    distortion_p2: -0.002696
+    distortion_k3: 0.000000
+
+# 4캠 확장의 세 번째 카메라(3번). 물리적으로 /dev/video4에 연결됨(예상대로 video3은
+# 카메라 2의 메타데이터 노드라 아니었음). YOLO/라이다 퓨전/버드아이뷰 없음,
+# front_camera_node와 같은 패턴.
+camera_3_node:
+  ros__parameters:
+    cam_num: 4
+    # C920이 이미 3대라 by-id가 서로 겹친다. by-path(꽂은 포트 기준)로 고정.
+    # 재연결하면 `ros2 run camera_perception_pkg list_cameras --probe`로 다시 확인할 것.
+    camera_device: /dev/v4l/by-path/platform-3610000.usb-usb-0:2.2.4.2:1.0-video-index0
+    pub_topic: /camera_3/image_raw
+    logger: false
+
+    frame_width: 640        # 캘리브레이션 뽑은 해상도와 반드시 같아야 함
+    frame_height: 480
+    autofocus: false
+    focus: -1
+    auto_exposure: false
+    exposure: -1
+    auto_white_balance: false
+    white_balance: -1
+    use_mjpg: true
+
+    # 캘리브레이션 (아직 코드에서 안 읽음, 향후 사용 대기)
+    fx: 478.681350
+    fy: 480.893055
+    cx: 314.853795
+    cy: 259.235816
+    distortion_k1: 0.019110
+    distortion_k2: -0.134271
+    distortion_p1: 0.007227
+    distortion_p2: -0.003467
+    distortion_k3: 0.000000
+
+# 네 번째 카메라(4번, 우측). 물리적으로 /dev/video6에 연결됨. YOLO/라이다 퓨전/
+# 버드아이뷰 없음, camera_2_node/camera_3_node와 같은 패턴. 런치파일은 안 만듦 -
+# 테스트는 `ros2 run camera_perception_pkg image_publisher_node --ros-args -p cam_num:=6`로.
+camera_4_node:
+  ros__parameters:
+    cam_num: 6
+    # C920이 이미 4대라 by-id가 서로 겹친다. by-path(꽂은 포트 기준)로 고정.
+    # 재연결하면 `ros2 run camera_perception_pkg list_cameras --probe`로 다시 확인할 것.
+    camera_device: /dev/v4l/by-path/platform-3610000.usb-usb-0:2.2.4.3:1.0-video-index0
+    pub_topic: /camera_4/image_raw
+    logger: false
+
+    frame_width: 640        # 캘리브레이션 뽑은 해상도와 반드시 같아야 함
+    frame_height: 480
+    autofocus: false
+    focus: -1
+    auto_exposure: false
+    exposure: -1
+    auto_white_balance: false
+    white_balance: -1
+    use_mjpg: true
+
+    # 캘리브레이션 (아직 코드에서 안 읽음, 향후 사용 대기)
+    fx: 596.565109
+    fy: 598.105200
+    cx: 343.712909
+    cy: 264.501084
+    distortion_k1: -0.030287
+    distortion_k2: -0.101105
+    distortion_p1: 0.002314
+    distortion_p2: -0.002512
+    distortion_k3: 0.000000
+
+# 카메라 2/3/4번을 한 창에 격자로 띄우는 단순 뷰어(multi_camera_view.launch.py에서 사용).
+# surround_view_node와 달리 지면 투영/블렌딩을 안 하고 원본을 그대로 붙인다 -
+# 카메라가 살아있는지, 어느 포트가 어느 화면인지 확인하는 용도.
+# 프레임이 안 오는 카메라는 회색 NO SIGNAL 타일로 표시된다(USB 전원 문제로 개별
+# 카메라가 수시로 떨어지는 이력이 있어서, 창 자체가 안 뜨는 것과 구분하려고 넣었다).
+multi_view_node:
+  ros__parameters:
+    topics: ['/camera_2/image_raw', '/camera_3/image_raw', '/camera_4/image_raw']
+    labels: ['camera_2 (2.2.4.1)', 'camera_3 (2.2.4.2)', 'camera_4 (2.2.4.3)']
+    output_topic: /multi_view/image
+    window_name: Multi Camera View
+    show_preview: true
+    resizable_window: true   # 창을 마우스로 끌어서 크기 조절 (false면 캔버스 크기 고정)
+    tile_width: 480       # 480x3 = 1440px 가로. 화면이 좁으면 줄일 것
+    tile_height: 360
+    columns: 0            # 0이면 카메라 수에 맞춰 자동(3대는 가로 한 줄)
+    publish_rate: 20.0
+    max_frame_age: 1.0    # 이 시간 넘게 프레임이 없으면 STALE로 표시
+
+# 서라운드 BEV. 캔버스는 "차를 한가운데 둔 지면 좌표계"다(800x1000).
+#   - 위쪽(y가 작은 쪽)이 차 앞, 아래쪽이 차 뒤
+#   - x가 클수록 차의 오른쪽
+#   - 가운데 [310,370,490,630]이 차량 자리
+#
+# 캔버스 크기를 800x1000으로 잡은 건 지금 필요해서가 아니라 나중에 전방 카메라를
+# 붙여 4방향 서라운드로 넓힐 때를 위해서다. dst_points는 이 캔버스의 픽셀 좌표로
+# 저장되므로, 캔버스 크기나 차량 위치를 바꾸는 순간 힘들게 찍어둔 네 점이 전부
+# 어긋난다. 그래서 좌표계는 처음부터 최종 형태로 고정해두고, 당장 안 쓰는 앞쪽은
+# view_rect로 잘라서 안 내보낸다(자르는 게 아니라 아예 계산을 안 한다 - 후방만 볼
+# 때 그만큼 빨라진다). 전방 카메라를 붙일 때는 front.enabled를 켜고 view_rect를
+# 비우면 되고, 이미 찍어둔 후방/좌우 점은 그대로 유효하다.
+#
+# 좌/우 카메라는 비스듬히 뒤를 보고 있어서 후방 카메라와 겹치는 영역이 넓다. 겹치는
+# 곳을 평균내면(blend_mode: average) 광각 왜곡이 심한 측면 영상이 선명한 후방 영상
+# 위에 번져서 둘 다 흐려진다. 그래서 blend_mode를 priority로 두고 rear의
+# blend_priority를 가장 높게 잡았다 - 후방이 덮는 곳은 후방이 그대로 나오고, 좌/우는
+# 후방이 못 보는 바깥쪽만 채운다.
+#
+# src_points(입력 영상 속 지면 사다리꼴)와 dst_points(캔버스상 대응점)는 아래 값이
+# 출발점일 뿐 실제 장착 상태의 값이 아니다. 반드시 ROI 피커로 찍어서 덮어쓸 것:
+#   ros2 launch sensor_fusion_bringup roi_picker.launch.py
+# 바닥의 같은 지점을 카메라별로 같은 순서로 찍으면 세 영상이 캔버스에서 포개진다.
+# 피커의 s키가 아래 src_points/dst_points 줄을 직접 갱신한다(주석은 보존, 원본은
+# params.yaml.bak으로 백업).
+surround_view_node:
+  ros__parameters:
+    output_topic: /surround_view/image
+    canvas_width: 800
+    canvas_height: 1000
+    # 캔버스에서 실제로 내보낼 사각형 [x1, y1, x2, y2]. 지금은 차와 그 뒤쪽만.
+    # 전방까지 쓰려면 [0, 0, 800, 1000] (=캔버스 전체)으로 바꾸면 된다.
+    view_rect: [0, 340, 800, 1000]
+    publish_rate: 20.0
+    max_frame_age: 0.5
+    show_preview: true
+    window_name: Rear Surround View
+    blend_feather_px: 25    # 이음매 깃털 폭[px]. priority 모드에선 후방 영상 가장자리가
+                            # 좌/우 위로 부드럽게 떨어지는 정도를 정한다.
+    blend_mode: priority    # priority(겹치면 우선순위 높은 쪽) / average(가중 평균)
+    draw_vehicle: true
+    vehicle_rect: [310, 370, 490, 630]   # 캔버스 한가운데가 차량. 위가 앞, 아래가 뒤.
+    vehicle_label: FRONT
+    vehicle_color_bgr: [55, 55, 55]
+    draw_camera_outlines: false   # 각 카메라가 캔버스의 어디를 덮는지 윤곽선 표시.
+                                  # 정렬 맞출 때만 true.
+
+    # 전방은 아직 안 쓴다(1번 카메라는 YOLO 주행용으로 따로 돈다). 나중에 네 번째
+    # 카메라를 앞에 달면 enabled를 켜고 view_rect를 비운 뒤 피커로 점만 찍으면 된다.
+    front.enabled: false
+    front.topic: /front/image_raw
+    front.rotate_deg: 0
+    front.blend_priority: 20
+    front.normalized_src_points: true
+    front.src_points: [0.18, 0.55, 0.82, 0.55, 1.0, 1.0, 0.0, 1.0]
+    front.dst_points: [310.0, 370.0, 490.0, 370.0, 720.0, 0.0, 80.0, 0.0]
+
+    # 후방 = camera_2 (by-path 2.2.4.1). 왜곡이 가장 적고 뒤를 정면으로 보므로
+    # 겹치는 영역은 전부 이 카메라가 가져간다.
+    rear.enabled: true
+    rear.topic: /camera_2/image_raw
+    rear.rotate_deg: 0
+    rear.blend_priority: 30
+    rear.normalized_src_points: true
+    rear.src_points: [0.1747, 0.4568, 0.8866, 0.4539, 0.9949, 0.9874, 0.0509, 0.9769]
+    # 뒤를 보는 카메라라 영상의 왼쪽이 차의 오른쪽이다(캔버스 x가 큰 쪽).
+    rear.dst_points: [557.3, 891.3, 236.9, 891.3, 240.8, 687.5, 551.5, 689.4]
+
+    # 좌측 = camera_3 (by-path 2.2.4.2). 비스듬히 뒤를 본다.
+    left.enabled: true
+    left.topic: /camera_3/image_raw
+    left.rotate_deg: 0
+    left.blend_priority: 10
+    left.normalized_src_points: true
+    left.src_points: [0.1117, 0.2538, 0.3914, 0.2170, 0.8446, 0.6838, 0.2439, 0.9104]
+    left.dst_points: [291.3, 889.4, 130.1, 885.5, 130.1, 472.0, 293.2, 475.9]
+
+    # 우측 = camera_4 (by-path 2.2.4.3). 비스듬히 뒤를 본다.
+    right.enabled: true
+    right.topic: /camera_4/image_raw
+    right.rotate_deg: 0
+    right.blend_priority: 10
+    right.normalized_src_points: true
+    right.src_points: [0.7495, 0.8076, 0.1592, 0.6160, 0.6434, 0.1444, 0.8954, 0.1798]
+    right.dst_points: [513.1, 480.9, 669.9, 483.6, 655.4, 890.4, 506.8, 891.3]
+
+# surround_view_node의 src_points/dst_points를 마우스로 찍는 도구.
+# canvas_width/canvas_height/vehicle_rect/view_rect는 위 surround_view_node 섹션에서
+# 직접 읽어오므로 여기 또 적지 않는다(두 곳이 어긋나면 찍은 점이 안 맞게 된다).
+# priorities는 미리보기에서 겹칠 때 누가 위로 올라오는지에만 쓰인다 -
+# surround_view_node의 blend_priority와 같게 유지할 것.
+roi_picker_node:
+  ros__parameters:
+    topics: ['/camera_2/image_raw', '/camera_3/image_raw', '/camera_4/image_raw']
+    names: ['rear', 'left', 'right']
+    priorities: [30, 10, 10]
+    window_name: Surround ROI Picker
+    # 두 패널이 가로로 붙으므로 창 너비는 대략 이 값의 2.5배가 된다. 340이면
+    # 이 장비 화면(1024x768)에 들어간다. 큰 모니터를 붙이면 올릴수록 정밀해진다.
+    pane_height: 340
+    grid_step_px: 50
+    refresh_rate: 15.0
+    max_frame_age: 1.5
 
 yolov8_node:
   ros__parameters:
@@ -62,6 +297,9 @@ yolov8_node:
 
 image_fusion_node:
   ros__parameters:
+    # [헤드리스] 로컬 데스크톱 세션이 없으면(SSH만 연결된 상태) cv2.namedWindow가 Qt로
+    # SIGABRT를 내며 죽는다(실측 확인). 로컬 데스크톱에 다시 로그인하면 true로 되돌릴 것.
+    display: false
     # 카메라 내부파라미터(캘리브레이션 값). 4개 다 여기서 관리한다
     # (예전에는 fx/cx만 launch로 넘어가고 fy/cy는 소스 기본값이 조용히 쓰였음)
     fx: 565.529459
@@ -110,8 +348,10 @@ image_fusion_node:
     # 가장 가까운 하나만 보내면, 그걸 피해 지나가 박스가 사라지는 순간 판단에서 빠져
     # 다음 장애물만 보고 꺾다가 직전 장애물을 들이받는다.
     obstacle_array_topic: /lidar_obstacle_array
-    # 차선 마스크는 박스가 화면을 가득 채워서 "코앞에 장애물" 오판을 만든다. 장애물/표시 대상에서 제외
-    obstacle_class_exclude: "lane_1,lane_2"
+    # 회피는 YOLO로 인식한 콘(cone) 기준으로만 진행한다. drum/car_back은 장애물 판단에서
+    # 제외(클래스: cone/drum - best_cone.pt, car_back - car_back.pt, lane_1/lane_2 - lane_seg.pt).
+    # 차선 마스크는 박스가 화면을 가득 채워서 "코앞에 장애물" 오판을 만든다 - 이것도 제외.
+    obstacle_class_exclude: "lane_1,lane_2,drum,car_back"
     box_class_exclude: "lane_1,lane_2"
 
 l_shape_node:
@@ -137,6 +377,11 @@ l_shape_node:
     show_text: true
     text_size: 0.15
 
+    # RViz2 자동 실행 여부. 예전엔 이 키가 serial_sender_node 밑에 잘못 들어가 있어서
+    # 실제로는 안 읽히고 항상 false(fallback)로 떴다. 여기로 옮기고 그 실제 동작대로
+    # false로 명시. 라이다 점 확인하며 디버깅할 때만 true로.
+    launch_rviz: false
+
 # =============================================================
 # 이하: 자율주행(drive.launch.py) 전용. minicar_sim에서 이식한 인지->판단->제어 체인
 #   /detections -> lane_info_extractor -> /yolov8_lane_info
@@ -152,7 +397,9 @@ lane_info_extractor_node:
     sub_lidar_obstacle_array_topic: /lidar_obstacle_array
     pub_topic: /yolov8_lane_info
     roi_image_topic: /roi_image
-    show_image: true           # ROI 디버그 창(Lane Info). 헤드리스로 돌릴 땐 false
+    # [헤드리스] 로컬 데스크톱 세션 없을 땐 false 필수(같은 SIGABRT 위험). 다시 true로
+    # 되돌리려면 로컬 데스크톱에 로그인 후.
+    show_image: false
 
     # 차선 변경 시 옆 차선까지 이동할 BEV 픽셀 거리. minicar_sim은 200, 실차ws에서는 280을 썼음
     # 추종할 차선을 고정한다('lane_1'=좌측선 / 'lane_2'=우측선 / ''=자동 판단).
@@ -162,14 +409,62 @@ lane_info_extractor_node:
 
     lane_width_pixel: 280.0
     # 이 거리[m]보다 가까운 장애물만 회피 대상 (minicar_sim은 2.4)
+    # [마진 부족 -> 1.0 -> 1.8 상향] 트리거(1.0m) 직후부터 최근접까지 여유가 0.9m도 안 돼서,
+    # 방향은 맞게 틀었는데도 옆으로 충분히 벌어지기 전에 콘 옆을 스치는 사고가 실측됐다
+    # (avoid_debug 로그: offset=280으로 안정적으로 유지된 채로 dist 0.11m까지 접근·충돌).
+    # 1.8m면 반응 거리가 거의 2배라 옆으로 벌어질 시간이 늘어난다. 실측으로 재조정할 것.
     avoidance_trigger_dist: 1.8
-    shift_speed: 20.0          # 프레임당 오프셋 변화량(px). 클수록 차선 변경이 급해짐
+    # [회피가 약해서 콘에 박음 -> 20 -> 60 상향] 280px(lane_width_pixel) 전체 이동에
+    # 20px/프레임이면 14프레임(~1.5~2초) 걸려서 1m 트리거 거리 안에 못 끝났다.
+    # 60이면 약 5프레임(~0.5~0.7초)로 훨씬 빠르게 완료된다.
+    shift_speed: 60.0          # 프레임당 오프셋 변화량(px). 클수록 차선 변경이 급해짐
 
-    # [신규] 회피 오프셋 "해제" 디바운싱. 장애물이 현재 차선과 확실히 안 겹치는 게
-    # 이만큼 연속 프레임 확인돼야 원래 차선으로 복귀한다. 트리거(회피 시작)는 즉시.
-    # 미검출(정보 없음) 프레임은 이 카운트에 반영되지 않고 현재 회피 상태를 그대로 유지한다
-    # (장애물 근접 시 YOLO 인식이 끊기면서 조기 복귀해 그대로 박는 사고를 막기 위함).
-    avoidance_release_threshold_count: 15
+    # [와리가리 방지] 근접 구간에서 같은 콘의 박스가 커져 양쪽 차선에 동시에 걸치면서
+    # 복귀→재트리거를 반복하는 문제(실측 확인)를 막는 가드. 복귀하려는 반대쪽 차선이
+    # 최근 이 프레임 수 안에도 여전히 확인되고 있으면 "같은 콘"으로 보고 복귀를 보류한다.
+    obstacle_recent_frames_threshold: 5
+
+    # [08-18 실측 확인된 버그 - 단발 오판 방지] 장애물-차선 겹침 래치를 걸기 전 요구하는
+    # 연속 확인 프레임 수. 근접 구간에서 차선 박스 폭이 순간적으로 넓게 잡히면 반대쪽 차선
+    # 장애물까지 단 한 프레임 겹쳐서 래치가 걸렸다 - 실제로 오른쪽(lane_1) 콘을
+    # 왼쪽(lane_2)으로 오판해 콘 쪽으로 회피가 발동한 사고가 실측됐다.
+    obstacle_confirm_frames: 2
+
+    # [와리가리 방지 - 진짜 원인] 위 shift_speed=60 기준 차선 이동 자체가 약 5프레임 걸리는데
+    # obstacle_recent_frames_threshold도 5라서, 이동이 막 끝난 순간(settled) 이 가드가 이미
+    # 무력화돼 있었다("최근 5프레임"이 하필 이동 중이었던 프레임들이라 반대쪽 겹침이 안 잡힘)
+    # - 그래서 도착하자마자 바로 되돌아가는 게 실측된 와리가리의 실제 원인. 전환(진입/복귀)이
+    # 한 번 일어나면, 그 뒤 이 프레임 수 동안은 반대 방향 전환 판단 자체를 아예 건너뛰는
+    # 쿨다운으로 확실히 막는다. shift_speed=60 기준 대략 10fps 가정 시 ~1.5초.
+    # [08-18 사용자 요청 - 3.5초로 연장] 한 번 방향이 결정되면 그 뒤 3.5초간은 무슨 일이
+    # 있어도(장애물 재인식 등) 방향이 안 바뀌게 해달라는 요청. 10fps 가정 시 35프레임.
+    min_avoidance_dwell_frames: 35
+
+    # [차선 합류] 회피로 옮겨간 차선의 선이 이만큼 연속 프레임 동안 안 보이고 반대쪽
+    # 선만 보이면 "실제로 합류"로 보고, 장애물 유무와 무관하게 강제로 원래 차선으로
+    # 되돌린다. 안 그러면 합류 지점에서 없는 차선(도로 밖)을 계속 타겟으로 잡고
+    # 이탈한다(실측 확인). lane_change_threshold_count와 같은 근거로 15.
+    lane_merge_confirm_frames: 15
+
+    # [근접 구간 플리커링 방지] 추종 기준선 전환 디바운싱. has_lane_1/has_lane_2가 프레임마다
+    # 뒤집혀서 current_offset과 실제 조향이 같이 떨려 회피가 무력화되는 걸 막는다(실측 확인:
+    # 콘 앞에서 회피가 안 먹히고 그대로 부딪힘). 이만큼 연속으로 같은 판정이 나와야 전환한다.
+    track_class_switch_threshold: 3
+
+    # [타겟 좌표 노이즈 방지] 각 행(row)의 차선 중심 x좌표에 프레임당 최대 변화량[px]을
+    # 건다. get_lane_center()가 매 프레임 기억 없이 새로 계산해서, 근접 구간에 콘이 선을
+    # 가리면 "두 선 보임" 오판으로 타겟이 프레임마다 수백 px씩 튀었다 - 회피 오프셋은
+    # 안정적으로 유지되는데도 차가 물리적으로 좌우로 흔들리다 부딪힌 원인(실측 확인).
+    # [08-18 강화] lookahead_distance/Kp를 바꿔도 raw_target_x 흔들림이 그대로였다 - 제어
+    # 쪽 문제가 아니라 세그멘테이션 모델(.pt)이 프레임마다 마스크를 불안정하게 뽑는 게
+    # 근본 원인으로 보인다(실측: 직선 구간에서도 theta가 -24~+42도로 튐). 오늘 밤은
+    # 재학습이 불가능하니 이 필터를 더 세게 조여서 노이즈를 흡수한다.
+    target_x_rate_limit_px: 20.0
+
+    # [회피 동작] 장애물을 피해 옮긴 차선을 계속 유지하며 주행한다 - 자동으로 원래
+    # 차선에 복귀하지 않는다. 그 차선에서 새 장애물을 만나야만 반대쪽으로 다시 옮긴다.
+    # 진입/복귀 둘 다 "지금 있는 차선에 장애물 확인"이라는 같은 이벤트라 즉시 반응하고
+    # (디바운싱 없음), 미검출(정보 없음) 프레임은 판단 없이 현재 차선을 유지한다.
 
     image_center_x: 320
     lane_1_far_left_threshold: 180.0
@@ -212,6 +507,25 @@ lane_info_extractor_node:
     # BEV 스케일로 독립 계산한 값(약 212)과도 일치한다.
     lane_width_for_center: 216
 
+    # [lane_1 전용 폭 - 아직 미보정] 위 216은 lane_2만 91% 추종한 실측으로 역산된 값이라
+    # lane_1(우측선, 카메라가 차체 중심에서 벗어나 있어 좌우 비대칭)에는 안 맞을 수 있다
+    # (실측 확인: 회피로 lane_1 추종 중 직진 불안정 -> 복귀 시 벽 충돌). -1.0이면 위
+    # lane_width_for_center와 동일하게 취급. 직선 구간에서 fixed_lane_class:'lane_1'로
+    # 잠깐 태워서 target_x 평균을 재고 README 10번 공식(보정량 = 2 x (평균-car_center_x))
+    # 으로 재보정할 것.
+    # [08-18 재판단 #2] draw_edges()는 마스크의 닫힌 윤곽선(polylines)을 그린다 - 마스크가
+    # 얇은 선이 아니라 넓은 블롭이면, 한 행을 스캔할 때 그 블롭의 앞/뒤 경계 두 곳에서
+    # 픽셀이 잡혀 항상 "TWO_LINE"으로 분류된다. 이건 lane_1이 실선이라 생기는 문제가
+    # 아니라 - 실측 확인 결과 lane_2(정상 주행 중)도 똑같이 거의 매 프레임 TWO_LINE이었다.
+    # 즉 이 분기가 이 시스템에서 원래 정상 동작 경로였다. lane_1만 force_single_line으로
+    # 강제 우회시킨 어제 수정은 lane_2와 다른(검증 안 된) 계산식을 쓰게 만든 것이라
+    # 되돌린다(아래 lane_center_force_single_line_lane1: false). lane_width_for_center_lane1은
+    # TWO_LINE 분기에서는 아예 안 쓰이므로(중점 계산이라 폭 무관) 216은 그냥 폴백으로 둔다.
+    lane_width_for_center_lane1: 216.0
+    # [08-18 원복] 근거였던 "lane_1 실선 -> 두 선 오판" 이론이 틀린 것으로 확인돼(위 주석)
+    # 되돌린다. lane_2와 동일하게 자동 판단(TWO_LINE 분기 자연스럽게 허용)하도록 둔다.
+    lane_center_force_single_line_lane1: false
+
     # 차선 기울기(cos) 보정 강도. 0.0=보정 없음(예전 동작), 1.0=완전 보정.
     #
     # get_lane_center는 '선위치 ± 폭/2'로 중심을 추정하는데, 이 이동을 차선에 수직이
@@ -223,19 +537,19 @@ lane_info_extractor_node:
     # 우회전 구간에서는 우측선이 곧 인코스라 "곡선에서 인코스 선을 밟고 주행"이 됐다.
     # theta는 dominant_gradient()가 이미 구해 넘겨주던 값인데 그동안 안 쓰이고 있었다.
     #
-    # [곡선 인코스 대응] 0.0 -> 0.5로 시운전 후, 완전 보정인 1.0으로 재상향.
-    # README 12번 7항: "곡선에서 인코스 선을 밟는다"는 증상은 제어 게인이 아니라
-    # 이 값이 꺼져 있는 게 먼저 의심 대상이라 명시돼 있다.
-    # 보정량이 커서(theta=49도면 타겟이 58px 이동) 다른 변경과 겹치면 원인을 못 가리니
-    # 이 값만 바꾸고 시운전해서 확인할 것. 보정 배율은 어떤 경우에도 2.0배로 제한된다.
-    lane_center_tilt_comp: 1.0
+    # [조향 방향 이상 증상 진단용 0.5 -> 0.0] 0.5에서도 우회전 구간에서 왼쪽으로
+    # 튀는 증상이 남아있었다. lane_2(우측선)는 우회전에서 인코스라 theta가 커지고,
+    # 보정이 세질수록 타겟을 왼쪽으로 더 세게 미는데 0.5도 여전히 과했던 것으로 보인다.
+    # 0.0(보정 완전 끔, 예전 동작)으로 내려 증상이 사라지는지 확인할 것. 사라지면
+    # tilt_comp가 원인 확정, 남으면 다른 원인(ROI 확장 등)을 봐야 한다.
+    lane_center_tilt_comp: 0.0
 
-    # '두 선이 보인다' 분기를 막을지 여부. false = 예전 동작.
-    # get_lane_center가 보는 선은 원리상 항상 1개(draw_edges가 추종 클래스 하나만 그림)라
-    # 원리만 보면 true가 맞다. 하지만 위 lane_width_for_center(216)가 이 분기가 살아있는
-    # 상태에서 주행 184프레임으로 역산된 값이라, true로 바꾸면 타겟이 108px 밀린다.
-    # 실제로 그렇게 해봤더니 차가 중심으로 복귀하지 못했다.
-    # 켜려면 lane_width_for_center를 반드시 다시 재고 함께 바꿀 것.
+    # [true로 시도했다가 되돌림] 진단 로그로 "두 선 보임" 분기 오발동(gap 300px 안팎에도
+    # 발동, 차선 이탈/벽 충돌의 원인)을 확인하고 true로 막아봤는데, 그러자 오히려
+    # 매 프레임 주행이 불안정해져 차선을 벗어났다 - lane_width_for_center(216)가 이
+    # 분기가 섞여 있던 상태에서 역산된 값이라 안 맞았던 것으로 보인다(예상했던 리스크,
+    # README 10번 참고). true로 재시도하려면 lane_width_for_center를 반드시 먼저
+    # 실주행 target_x 평균으로 재보정할 것 - 그 전에는 false 유지.
     lane_center_force_single_line: false
 
 path_planner_node:
@@ -315,6 +629,13 @@ motion_planner_node:
     # 실측 비교(시뮬레이션): 직진 -3.20 / 곡선 +4.50 (수정 전 -3.02 / +4.82)
     #
     # 여기서부터 한 번에 하나씩 다시 조인다. 순서는 README 12번 참고.
+    # [08-18 정정] 140으로 낮췄던 건 방향 착오였다 - lookahead_distance를 낮추는 건 README
+    # 11-5의 "곡선에서 안쪽으로 파고들 때" 처방이고, 지금 증상(직진 중 위빙)은 정반대로
+    # 예전에 170으로 올려서 고쳤던 그 증상이다(11-2 문서: "lookahead_distance=120을 그대로
+    # 두면 직진 횡오차 보정이 1.44배 과보정(위빙)" -> 170으로 올려서 해결). 되돌린다.
+    # 실측: 140에서도 raw_target_x가 여전히 수 초 주기로 150px 넘게 왕복 - lookahead 변경
+    # 자체가 인지 신호(raw_target_x)엔 영향을 안 준다는 것도 이때 확인(제어 쪽 파라미터라
+    # 당연함). 위빙이 그래도 남으면 아래 Kp를 낮추는 쪽으로 갈 것.
     lookahead_distance: 170.0
     wheelbase: 50.0
     max_steer_angle_rad: 0.379
@@ -322,7 +643,10 @@ motion_planner_node:
 
     # PD 보정
     use_pd: true
-    Kp: 0.01
+    # [08-18 위빙 대응] 수 초 주기의 저주파 좌우 흔들림은 스무딩(EMA/레이트리밋)으로는 안
+    # 걸러진다(그건 고주파 노이즈용) - 비례 게인이 상대적으로 세서 생기는 저댐핑 진동의
+    # 전형적인 패턴이라 Kp를 30% 낮춘다. lookahead_distance 원복과 별개로 같이 적용.
+    Kp: 0.007
     Kd: 0.045
     max_steer: 4.0                 # PD 보정분의 최대 절대값
     lookahead_y: 155
@@ -376,5 +700,3 @@ serial_sender_node:
     # (이 값을 검증 없이 false로 두고 진행하는 바람에, 제어기가 보정할 때마다
     #  반대로 밀려서 차가 한쪽으로 계속 흘러갔다)
     steer_invert: true             # 조향이 반대로 먹으면 true
-
-    launch_rviz: true
